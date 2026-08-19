@@ -15,6 +15,7 @@ builder.Services
 
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
+builder.Services.AddSingleton<ReleaseRiskEvaluator>();
 builder.Services.AddSingleton<
     IGitHubWebhookDeliveryRegistry,
     InMemoryGitHubWebhookDeliveryRegistry>();

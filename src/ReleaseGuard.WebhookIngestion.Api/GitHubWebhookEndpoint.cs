@@ -12,6 +12,7 @@ public static class GitHubWebhookEndpoint
         HttpRequest request,
         GitHubWebhookSignatureValidator signatureValidator,
         GitHubRiskInputMapper riskInputMapper,
+        ReleaseRiskEvaluator riskEvaluator,
         IGitHubWebhookDeliveryRegistry deliveryRegistry,
         CancellationToken cancellationToken)
     {
@@ -77,14 +78,22 @@ public static class GitHubWebhookEndpoint
             return Results.BadRequest();
         }
 
+        var riskAssessment = mappingResult.RiskInput is { } mappedRiskInput
+            ? riskEvaluator.Evaluate(mappedRiskInput)
+            : null;
+
         if (!deliveryRegistry.TryRegister(webhook))
         {
             return Results.Ok(GitHubWebhookReceipt.Duplicate(webhook));
         }
 
         return mappingResult.RiskInput is { } riskInput
+            && riskAssessment is { } assessment
             ? Results.Accepted(
-                value: GitHubWebhookReceipt.Accepted(webhook, riskInput))
+                value: GitHubWebhookReceipt.Accepted(
+                    webhook,
+                    riskInput,
+                    assessment))
             : Results.Accepted(value: GitHubWebhookReceipt.Ignored(webhook));
     }
 

@@ -74,6 +74,12 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         Assert.Equal(4, receipt.RiskInput.ChangedFiles);
         Assert.Equal(120, receipt.RiskInput.Additions);
         Assert.Equal(15, receipt.RiskInput.Deletions);
+        Assert.NotNull(receipt.RiskAssessment);
+        Assert.Equal(20, receipt.RiskAssessment.Score);
+        Assert.Equal(ReleaseRiskPolicy.LowLevel, receipt.RiskAssessment.Level);
+        var factor = Assert.Single(receipt.RiskAssessment.Factors);
+        Assert.Equal("primary_target_branch", factor.Code);
+        Assert.Equal(20, factor.Points);
     }
 
     [Fact]
@@ -134,6 +140,7 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         Assert.Equal(deliveryId, repeatedReceipt.DeliveryId);
         Assert.Equal("duplicate", repeatedReceipt.Status);
         Assert.Null(repeatedReceipt.RiskInput);
+        Assert.Null(repeatedReceipt.RiskAssessment);
     }
 
     [Theory]
@@ -161,6 +168,7 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         Assert.Equal(eventName, receipt.EventName);
         Assert.Equal("ignored", receipt.Status);
         Assert.Null(receipt.RiskInput);
+        Assert.Null(receipt.RiskAssessment);
     }
 
     [Fact]
