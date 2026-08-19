@@ -15,5 +15,7 @@
                       LogicalName="ReleaseGuard.Database.Migrations.V003.sql" />
     <EmbeddedResource Include="Database/Migrations/V004__create_release_risk_event_inbox.sql"
                       LogicalName="ReleaseGuard.Database.Migrations.V004.sql" />
+    <EmbeddedResource Include="Database/Migrations/V005__add_release_risk_ai_explanation_lifecycle.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V005.sql" />
   </ItemGroup>
 </Project>

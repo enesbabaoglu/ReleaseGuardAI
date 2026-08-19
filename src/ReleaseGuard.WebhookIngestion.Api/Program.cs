@@ -96,6 +96,14 @@ builder.Services
         $"{AiExplanationClientOptions.SectionName}:RequestTimeoutMilliseconds must be between {AiExplanationClientOptions.MinimumRequestTimeoutMilliseconds} and {AiExplanationClientOptions.MaximumRequestTimeoutMilliseconds}.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<AiExplanationProcessorOptions>()
+    .BindConfiguration(AiExplanationProcessorOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<AiExplanationProcessorOptions>,
+    AiExplanationProcessorOptionsValidator>();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
@@ -127,6 +135,9 @@ builder.Services.AddSingleton<
 builder.Services.AddSingleton<
     IReleaseRiskInboxStore,
     PostgreSqlReleaseRiskInboxStore>();
+builder.Services.AddSingleton<
+    IReleaseRiskExplanationStore,
+    PostgreSqlReleaseRiskExplanationStore>();
 builder.Services.AddHostedService<PostgreSqlSchemaInitializer>();
 builder.Services.AddHostedService<ReleaseRiskOutboxDispatcher>();
 builder.Services.AddSingleton<ReleaseRiskInboxProcessor>(serviceProvider =>
@@ -139,6 +150,7 @@ builder.Services.AddSingleton<ReleaseRiskInboxProcessor>(serviceProvider =>
             ILogger<ReleaseRiskInboxProcessor>>()));
 builder.Services.AddHostedService(serviceProvider =>
     serviceProvider.GetRequiredService<ReleaseRiskInboxProcessor>());
+builder.Services.AddHostedService<ReleaseRiskExplanationProcessor>();
 
 var app = builder.Build();
 

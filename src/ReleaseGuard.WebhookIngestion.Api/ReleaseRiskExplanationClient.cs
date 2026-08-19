@@ -23,6 +23,13 @@ public sealed record ReleaseRiskExplanation
 
     [JsonRequired]
     public required IReadOnlyList<string> Recommendations { get; init; }
+
+    public bool IsValidFor(Guid eventId) =>
+        EventId == eventId &&
+        !string.IsNullOrWhiteSpace(Summary) &&
+        Recommendations is { Count: > 0 } &&
+        Recommendations.All(
+            recommendation => !string.IsNullOrWhiteSpace(recommendation));
 }
 
 public class ReleaseRiskExplanationContractException : Exception
@@ -165,9 +172,7 @@ public sealed class HttpReleaseRiskExplanationClient :
                 explanation.EventId);
         }
 
-        if (string.IsNullOrWhiteSpace(explanation.Summary) ||
-            explanation.Recommendations is not { Count: > 0 } ||
-            explanation.Recommendations.Any(string.IsNullOrWhiteSpace))
+        if (!explanation.IsValidFor(requestEventId))
         {
             throw new ReleaseRiskExplanationContractException(
                 "The explanation response must contain a non-empty summary and at least one non-empty recommendation.");

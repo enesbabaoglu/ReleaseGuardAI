@@ -286,7 +286,7 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
-        Assert.Equal(new[] { 1, 2, 3, 4 }, await ReadMigrationVersionsAsync(connectionString));
+        Assert.Equal(new[] { 1, 2, 3, 4, 5 }, await ReadMigrationVersionsAsync(connectionString));
         Assert.Equal(1, await CountDeliveriesAsync(connectionString));
         Assert.Equal(0, await CountOutboxMessagesAsync(connectionString));
 
