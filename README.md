@@ -2,19 +2,19 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo şu anda **Checkpoint 3: doğrulanmış GitHub teslimat sözleşmesi ve süreç-içi idempotency** aşamasına ulaşmıştır. Webhook uç noktası imzayı doğruladıktan sonra teslimat kimliğini, olay türünü ve JSON payload'ını açık bir sözleşmeye dönüştürür; aynı teslimatın tekrarını ikinci kez kabul etmez. Kafka, PostgreSQL, normalize edilmiş risk event'leri, Python AI servisi ve dashboard henüz eklenmemiştir.
+Bu depo şu anda **Checkpoint 4: ilk normalize edilmiş ReleaseGuard risk girdisi** aşamasına ulaşmıştır. Webhook uç noktası önce GitHub imzasını ve genel teslimat sözleşmesini doğrular; ardından ilk desteklenen kombinasyon olan `pull_request` / `opened` payload'ını dar bir `ReleaseRiskInput` nesnesine dönüştürür. Kafka, PostgreSQL, gerçek risk puanlama motoru, Python AI servisi ve dashboard henüz eklenmemiştir.
 
 ## Bu adımda ne yapıyoruz?
 
-- İmza kontrolünü geçen isteği `VerifiedGitHubWebhook` sözleşmesine dönüştürüyoruz.
-- Sözleşmede `X-GitHub-Delivery` kaynaklı bir `Guid`, `X-GitHub-Event` kaynaklı olay adı ve değişmez bir JSON payload snapshot'ı taşıyoruz.
-- Eksik/bozuk metadata ile geçersiz JSON'u kaydetmeden reddediyoruz.
-- Aynı teslimat GUID'sini süreç içinde atomik olarak yalnızca bir kez kaydediyor, tekrarını başarılı fakat `duplicate` olarak yanıtlıyoruz.
-- Tüm akışları gerçek ASP.NET Core test host'u üzerinden doğruluyoruz.
+- İlk desteklenen GitHub `event` / `action` çiftini `pull_request` / `opened` olarak seçiyoruz. `Event`, “pull request” gibi olay ailesidir; `action` ise bu olayın “açıldı” gibi alt türüdür.
+- Doğrulanmış genel JSON `payload`'ını, yani isteğin veri gövdesini, ReleaseGuard'ın ihtiyaç duyduğu az sayıdaki tutarlı alana dönüştürüyoruz. Buna **normalizasyon** denir.
+- Üretilen `ReleaseRiskInput`; kaynak teslimat kimliği, depo, değişiklik numarası, başlık, yazar, kaynak/hedef dal, draft durumu, değişen dosya ve eklenen/silinen satır sayılarını taşır.
+- Desteklenmeyen olay veya action'ı hata saymadan `ignored`, desteklenen kombinasyondaki eksik/yanlış alanları `400 Bad Request` olarak yanıtlıyoruz.
+- Mevcut imza kontrolü ve süreç-içi tekrar engelleme davranışını koruyor; tüm akışı gerçek ASP.NET Core test host'u üzerinden doğruluyoruz.
 
-## Neden bu kadar küçük başlıyoruz?
+## Neden yapıyoruz?
 
-GitHub başarısız ya da manuel yeniden teslimatlarda aynı webhook'u tekrar gönderebilir. Kimlik kontrolü olmadan ileride aynı analiz, kayıt veya bildirim birden fazla üretilebilir. Idempotency, aynı teslimatın tekrar edilmesinin ikinci bir işleme yol açmaması demektir. Önce bu davranışı küçük bir süreç-içi sınırda testlerle sabitlemek, kalıcı altyapı eklenmeden sözleşmeyi ve HTTP davranışını görünür kılar.
+GitHub payload'ları çok geniştir ve GitHub'a özgü iç içe alanlar taşır. Risk değerlendirme kodu doğrudan bu yapıya bağlanırsa hem anlaşılması zorlaşır hem de sağlayıcı değişikliklerinden kolay etkilenir. Dar bir risk girdisi, sonraki puanlama adımının yalnızca ihtiyaç duyduğu kavramları görmesini sağlar. Tek event/action ile başlamak ise hangi alanların gerçekten gerekli olduğunu testlerle öğrenmemize, henüz ihtiyaç duyulmayan onlarca payload modeli üretmememize yardımcı olur.
 
 ## Mimari kararlar
 
@@ -26,11 +26,13 @@ Bu checkpoint'te aynı byte'ları imza doğrulamasından sonra JSON olarak okuya
 
 Trade-off: istek iki kez okunur ve buffering ek bellek/disk I/O maliyeti getirir. Ayrıca JSON ağacının kendisi bellekte tutulur. Bu küçük kabul sınırı için sadedir; yoğun trafikte streaming ayrıştırma, açık payload boyutu sınırı ve ölçüm ayrıca değerlendirilmelidir.
 
-### Domain sözleşmesi neden bu kadar genel?
+### Genel envelope ile risk girdisi neden ayrı?
 
-`VerifiedGitHubWebhook`, yalnızca bu sınırda güvenle bildiğimiz üç alanı taşır: teslimat GUID'si, olay adı ve JSON payload. Payload `JsonElement.Clone()` ile belge ömründen bağımsız, değişmez bir snapshot olur. JSON kökünün nesne olması zorunludur.
+`VerifiedGitHubWebhook`, güvenlik ve taşıma sınırıdır; teslimat GUID'sini, olay adını ve değişmez JSON snapshot'ını taşımaya devam eder. `ReleaseRiskInput` ise ReleaseGuard'ın iş sınırıdır; GitHub'ın iç içe nesne adlarını sonraki risk koduna sızdırmaz. Böylece imza/HTTP ayrıntıları ile risk değerlendirme kavramları birbirine karışmaz.
 
-Olay adı enum yapılmadı; GitHub zaman içinde yeni olay türleri ekleyebildiği için enum bilinmeyen ama geçerli teslimatları gereksiz yere reddeder. Pull request, push, CI veya deployment payload'larını ReleaseGuard'ın daha kararlı ve sağlayıcıdan bağımsız risk event'lerine dönüştürmek ayrı bir sonraki adımdır. Bu seçim erken aşamada onlarca GitHub payload sınıfı üretme maliyetinden kaçınır; trade-off olarak bu sözleşme henüz alan bazlı compile-time güvence sağlamaz.
+`GitHubRiskInputMapper` yalnızca `pull_request` / `opened` kombinasyonunu bir `change_opened` girdisine çevirir. Ek JSON alanları yok sayılır; gerekli alanların türü ve temel sınırları açıkça doğrulanır. Desteklenmeyen bir event/action geçerli bir GitHub teslimatı olabileceği için `ignored` kabul edilir. Buna karşılık desteklendiğini söylediğimiz `opened` payload'ı eksikse sessizce veri uydurmak yerine `400` döner ve teslimat GUID'si rezerve edilmez.
+
+Trade-off: ilk model risk için yararlı değişiklik büyüklüğünü taşır fakat dosya yolları, commit listesi, etiketler veya review bilgisi taşımaz. Ayrıca şu anda yalnızca GitHub kaynaklıdır ve normalize edilmiş girdiyi henüz bir puanlayıcıya ya da kalıcı kuyruğa vermez; `202` yanıtındaki `riskInput` dönüşümü görünür ve test edilebilir kılar. Yeni alanlar gerçek bir risk kuralı tarafından gerekçelendirilmeden modele eklenmeyecektir.
 
 ### Idempotency anahtarı ve sınırı
 
@@ -56,14 +58,15 @@ Minimum uzunluk tahmin edilmesi kolay secret riskini azaltır. Trade-off: eski v
 
 | Durum | Yanıt | Gerekçe |
 | --- | --- | --- |
-| İmza ve sözleşme geçerli, GUID yeni | `202 Accepted` + `accepted` receipt | Teslimat bu süreçte ilk kez kaydedildi. |
+| Desteklenen event/action ve sözleşme geçerli, GUID yeni | `202 Accepted` + `accepted` receipt | Teslimat kaydedildi ve normalize edildi. |
+| Teslimat geçerli fakat event/action desteklenmiyor | `202 Accepted` + `ignored` receipt | Göndericinin yeniden denemesine yol açmadan bilinçli olarak işlenmedi. |
 | GUID daha önce kaydedilmiş | `200 OK` + `duplicate` receipt | Tekrar güvenli biçimde sonlandırıldı; gönderici bunu hata sayıp yeniden denemez. |
 | İmza başlığı eksik | `401 Unauthorized` | İstek gerekli kimlik doğrulama kanıtını taşımıyor. |
 | İmza şeması/uzunluğu/hex biçimi bozuk | `400 Bad Request` | İstemci imza protokolüne uymayan bir değer gönderdi. |
 | Biçimi doğru fakat digest yanlış | `401 Unauthorized` | Kimlik doğrulama başarısız; ayrıntılı karşılaştırma bilgisi açıklanmaz. |
-| İmza geçerli fakat teslimat/olay başlığı eksik, GUID bozuk veya JSON geçersiz | `400 Bad Request` | Güvenlik kontrolünü geçen istek domain sözleşmesine dönüştürülemedi. |
+| İmza geçerli fakat teslimat/olay başlığı eksik, GUID bozuk, JSON geçersiz veya desteklenen payload eksik | `400 Bad Request` | Güvenlik kontrolünü geçen istek gerekli sözleşmeye dönüştürülemedi. |
 
-`X-Hub-Signature-256` tamamen eksikse `401`; imza başlığı var fakat biçimi bozuksa `400` davranışı korunur. Geçerli istekte henüz risk analizi veya harici event yayını yapılmaz. İlk teslimattaki `202`, doğrulanmış sözleşmenin süreç-içi kayda alındığını bildirir.
+`X-Hub-Signature-256` tamamen eksikse `401`; imza başlığı var fakat biçimi bozuksa `400` davranışı korunur. İlk desteklenen teslimattaki `202`, doğrulanmış sözleşmenin süreç-içi kayda alındığını ve risk girdisine dönüştürüldüğünü bildirir; henüz risk skoru veya harici event yayını üretilmez.
 
 ### Neden monorepo?
 
@@ -83,7 +86,7 @@ Hedef teknoloji .NET 10'dur; ancak incelenen makinede yalnızca .NET SDK `8.0.41
 
 ### Neden hâlâ Kafka veya veritabanı yok?
 
-Bu turda çözdüğümüz problem doğrulanmış teslimat sözleşmesi ile tekrar algılama davranışıdır. Kafka ve PostgreSQL; bağlantı yönetimi, migration, transaction ve yeniden deneme gibi ayrı hata modları getirir. Önce idempotency semantiğini süreç içinde testlerle sabitlemek, daha sonra kalıcı depoyu aynı arayüzün arkasında eklemeyi kolaylaştırır. Bellek implementasyonu üretim alternatifi olarak sunulmaz.
+Bu turda çözdüğümüz problem, GitHub'a özgü geniş JSON'dan ReleaseGuard'a özgü dar girdiye doğru dönüşümdür. Kafka ve PostgreSQL; bağlantı yönetimi, migration, transaction ve yeniden deneme gibi ayrı hata modları getirir ve dönüşüm kararını doğrulamak için gerekli değildir. Bellek idempotency implementasyonu üretim alternatifi olarak sunulmaz; ilk gerçek yan etki veya çoklu-instance çalışma eklenmeden önce kalıcı benzersiz anahtar ve transaction sınırı tasarlanmalıdır.
 
 ## Yerel ortam bulguları
 
@@ -113,7 +116,9 @@ ReleaseGuard/
 │       ├── GitHubWebhookEndpoint.cs
 │       ├── GitHubWebhookOptions.cs
 │       ├── GitHubWebhookReceipt.cs
+│       ├── GitHubRiskInputMapper.cs
 │       ├── GitHubWebhookSignatureValidator.cs
+│       ├── ReleaseRiskInput.cs
 │       └── VerifiedGitHubWebhook.cs
 └── tests/
     └── ReleaseGuard.WebhookIngestion.Api.Tests/
@@ -167,17 +172,32 @@ Beklenen sağlık yanıtı:
 {"status":"ok","service":"webhook-ingestion"}
 ```
 
-GitHub webhook ayarında payload URL'sini `/webhooks/github`, content type'ı `application/json` ve secret'i uygulamaya verilen değerle aynı ayarlayın. GitHub her teslimatta gerekli `X-Hub-Signature-256`, `X-GitHub-Delivery` ve `X-GitHub-Event` başlıklarını gönderir. İlk geçerli teslimatın örnek yanıtı şöyledir:
+GitHub webhook ayarında payload URL'sini `/webhooks/github`, content type'ı `application/json` ve secret'i uygulamaya verilen değerle aynı ayarlayın. GitHub her teslimatta gerekli `X-Hub-Signature-256`, `X-GitHub-Delivery` ve `X-GitHub-Event` başlıklarını gönderir. İlk geçerli ve desteklenen teslimatın örnek yanıtı şöyledir:
 
 ```json
 {
   "deliveryId": "0b989ba4-242f-11e5-81e1-c7b6966d2516",
   "eventName": "pull_request",
-  "status": "accepted"
+  "status": "accepted",
+  "riskInput": {
+    "sourceDeliveryId": "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+    "sourceProvider": "github",
+    "kind": "change_opened",
+    "repository": "acme/ReleaseGuard",
+    "changeNumber": 42,
+    "title": "Protect production releases",
+    "author": "octocat",
+    "baseBranch": "main",
+    "headBranch": "feature/release-guard",
+    "isDraft": false,
+    "changedFiles": 4,
+    "additions": 120,
+    "deletions": 15
+  }
 }
 ```
 
-Aynı GUID tekrar gelirse `status` değeri `duplicate` olur. Otomatik testler imza hatalarına ek olarak sözleşme alanlarını, JSON ayrıştırmayı ve tekrar teslimatı gerçek HTTP istekleriyle kapsar; manuel HMAC üretimi doğrulama için gerekli değildir.
+Aynı GUID tekrar gelirse `status` değeri `duplicate` olur. Desteklenmeyen event/action için `status` değeri `ignored` ve `riskInput` değeri `null` olur. Otomatik testler imza hatalarına ek olarak normalizasyon alanlarını, bozuk desteklenen payload'ı, bilinmeyen olayları, JSON ayrıştırmayı ve tekrar teslimatı gerçek HTTP istekleriyle kapsar; manuel HMAC üretimi doğrulama için gerekli değildir.
 
 ## Nasıl doğruladık?
 
@@ -187,8 +207,8 @@ Checkpoint aşağıdaki sırayla doğrulanır:
 2. Solution build ile warning-as-error dahil tüm projelerin derlenmesi.
 3. Gerçek ASP.NET Core test host'u üzerinden sağlık ve webhook senaryolarının çalışması.
 
-Son doğrulamada build `0 uyarı / 0 hata`, testler `12/12 başarılı` sonucunu verdi. Kısıtlı sandbox'ta test runner yerel IPC soketi açmak için ek izin isteyebilir; bu uygulamanın ağ bağımlılığı olduğu anlamına gelmez.
+Son doğrulamada build `0 uyarı / 0 hata`, testler `15/15 başarılı` sonucunu verdi. Kısıtlı sandbox'ta test runner yerel IPC soketi açmak için ek izin isteyebilir; bu uygulamanın ağ bağımlılığı olduğu anlamına gelmez.
 
 ## Sıradaki küçük adım
 
-Bu checkpoint burada durur. Sonraki küçük adımda desteklenecek ilk GitHub event türü ve `action` seçilip genel JSON envelope'undan ReleaseGuard'a özgü, normalize edilmiş bir risk girdisine dönüşüm tasarlanabilir. Kalıcı idempotency deposu ise ilk gerçek yan etki veya çoklu-instance çalışma eklenmeden önce benzersiz anahtar ve transaction sınırıyla ele alınmalıdır.
+Bu checkpoint burada durur. Sonraki küçük adımda `ReleaseRiskInput` üzerinden çalışan, yan etkisiz ve açıklanabilir ilk deterministik risk değerlendirmesi tasarlanabilir; örneğin değişen dosya ve satır sayılarını açık eşiklerle sınıflandırıp sonucu gerekçeleriyle döndürebilir. `synchronize` gibi yeni action'lar ancak aynı girdiye hangi güncelleme semantiğiyle bağlanacağı netleştiğinde eklenmelidir. Kalıcı idempotency deposu ise ilk gerçek yan etki veya çoklu-instance çalışma eklenmeden önce benzersiz anahtar ve transaction sınırıyla ele alınmalıdır.

@@ -11,6 +11,7 @@ public static class GitHubWebhookEndpoint
     public static async Task<IResult> HandleAsync(
         HttpRequest request,
         GitHubWebhookSignatureValidator signatureValidator,
+        GitHubRiskInputMapper riskInputMapper,
         IGitHubWebhookDeliveryRegistry deliveryRegistry,
         CancellationToken cancellationToken)
     {
@@ -69,10 +70,22 @@ public static class GitHubWebhookEndpoint
         }
 
         var webhook = new VerifiedGitHubWebhook(deliveryId, eventName, payload);
+        var mappingResult = riskInputMapper.Map(webhook);
 
-        return deliveryRegistry.TryRegister(webhook)
-            ? Results.Accepted(value: GitHubWebhookReceipt.Accepted(webhook))
-            : Results.Ok(GitHubWebhookReceipt.Duplicate(webhook));
+        if (mappingResult.Status == GitHubRiskInputMappingStatus.Invalid)
+        {
+            return Results.BadRequest();
+        }
+
+        if (!deliveryRegistry.TryRegister(webhook))
+        {
+            return Results.Ok(GitHubWebhookReceipt.Duplicate(webhook));
+        }
+
+        return mappingResult.RiskInput is { } riskInput
+            ? Results.Accepted(
+                value: GitHubWebhookReceipt.Accepted(webhook, riskInput))
+            : Results.Accepted(value: GitHubWebhookReceipt.Ignored(webhook));
     }
 
     private static bool TryGetSingleHeader(

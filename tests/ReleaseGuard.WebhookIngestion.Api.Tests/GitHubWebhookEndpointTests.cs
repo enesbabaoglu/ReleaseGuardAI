@@ -10,7 +10,31 @@ namespace ReleaseGuard.WebhookIngestion.Api.Tests;
 public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFactory>
 {
     private static readonly byte[] Payload = Encoding.UTF8.GetBytes(
-        """{"action":"opened","repository":{"full_name":"acme/ReleaseGuard"}}""");
+        """
+        {
+          "action": "opened",
+          "number": 42,
+          "repository": {
+            "full_name": "acme/ReleaseGuard"
+          },
+          "pull_request": {
+            "title": "Protect production releases",
+            "user": {
+              "login": "octocat"
+            },
+            "base": {
+              "ref": "main"
+            },
+            "head": {
+              "ref": "feature/release-guard"
+            },
+            "draft": false,
+            "changed_files": 4,
+            "additions": 120,
+            "deletions": 15
+          }
+        }
+        """);
 
     private readonly HttpClient _client;
 
@@ -36,6 +60,20 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         Assert.Equal(deliveryId, receipt.DeliveryId);
         Assert.Equal("pull_request", receipt.EventName);
         Assert.Equal("accepted", receipt.Status);
+        Assert.NotNull(receipt.RiskInput);
+        Assert.Equal(deliveryId, receipt.RiskInput.SourceDeliveryId);
+        Assert.Equal("github", receipt.RiskInput.SourceProvider);
+        Assert.Equal("change_opened", receipt.RiskInput.Kind);
+        Assert.Equal("acme/ReleaseGuard", receipt.RiskInput.Repository);
+        Assert.Equal(42, receipt.RiskInput.ChangeNumber);
+        Assert.Equal("Protect production releases", receipt.RiskInput.Title);
+        Assert.Equal("octocat", receipt.RiskInput.Author);
+        Assert.Equal("main", receipt.RiskInput.BaseBranch);
+        Assert.Equal("feature/release-guard", receipt.RiskInput.HeadBranch);
+        Assert.False(receipt.RiskInput.IsDraft);
+        Assert.Equal(4, receipt.RiskInput.ChangedFiles);
+        Assert.Equal(120, receipt.RiskInput.Additions);
+        Assert.Equal(15, receipt.RiskInput.Deletions);
     }
 
     [Fact]
@@ -95,6 +133,56 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         Assert.NotNull(repeatedReceipt);
         Assert.Equal(deliveryId, repeatedReceipt.DeliveryId);
         Assert.Equal("duplicate", repeatedReceipt.Status);
+        Assert.Null(repeatedReceipt.RiskInput);
+    }
+
+    [Theory]
+    [InlineData("pull_request", "closed")]
+    [InlineData("push", "opened")]
+    public async Task PostWebhook_WithUnsupportedEventOrAction_ReturnsIgnoredReceipt(
+        string eventName,
+        string action)
+    {
+        var payload = Encoding.UTF8.GetBytes($$"""
+            {
+              "action": "{{action}}"
+            }
+            """);
+        using var request = CreateRequest(
+            payload,
+            CreateSignature(payload),
+            eventName: eventName);
+
+        using var response = await _client.SendAsync(request);
+        var receipt = await response.Content.ReadFromJsonAsync<GitHubWebhookReceipt>();
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(receipt);
+        Assert.Equal(eventName, receipt.EventName);
+        Assert.Equal("ignored", receipt.Status);
+        Assert.Null(receipt.RiskInput);
+    }
+
+    [Fact]
+    public async Task PostWebhook_WithInvalidOpenedPullRequest_DoesNotReserveDeliveryId()
+    {
+        var deliveryId = Guid.NewGuid();
+        var incompletePayload = Encoding.UTF8.GetBytes(
+            """{"action":"opened","number":42}""");
+        using var incompleteRequest = CreateRequest(
+            incompletePayload,
+            CreateSignature(incompletePayload),
+            deliveryId: deliveryId.ToString());
+        using var validRequest = CreateRequest(
+            Payload,
+            CreateSignature(Payload),
+            deliveryId: deliveryId.ToString());
+
+        using var incompleteResponse = await _client.SendAsync(incompleteRequest);
+        using var validResponse = await _client.SendAsync(validRequest);
+
+        Assert.Equal(HttpStatusCode.BadRequest, incompleteResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, validResponse.StatusCode);
     }
 
     [Theory]
@@ -166,6 +254,7 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         byte[] requestBody,
         string? signature,
         string? deliveryId = null,
+        string eventName = "pull_request",
         bool includeDeliveryHeader = true,
         bool includeEventHeader = true)
     {
@@ -190,7 +279,7 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
 
         if (includeEventHeader)
         {
-            request.Headers.Add(GitHubWebhookEndpoint.EventHeaderName, "pull_request");
+            request.Headers.Add(GitHubWebhookEndpoint.EventHeaderName, eventName);
         }
 
         return request;
