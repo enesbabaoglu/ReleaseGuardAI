@@ -34,6 +34,25 @@ public sealed class PostgreSqlGitHubWebhookDeliveryStore : IGitHubWebhookDeliver
         RETURNING delivery_id;
         """;
 
+    private const string InsertOutboxMessageSql = """
+        INSERT INTO release_risk_outbox_messages (
+            event_id,
+            delivery_disposition,
+            event_type,
+            schema_version,
+            source_provider,
+            event_kind,
+            envelope)
+        VALUES (
+            @event_id,
+            'accepted',
+            @event_type,
+            @schema_version,
+            @source_provider,
+            @event_kind,
+            @envelope);
+        """;
+
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web);
 
@@ -64,6 +83,43 @@ public sealed class PostgreSqlGitHubWebhookDeliveryStore : IGitHubWebhookDeliver
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var insertedDeliveryId = await InsertDeliveryAsync(
+            connection,
+            transaction,
+            webhook,
+            disposition,
+            riskInputJson,
+            riskAssessmentJson,
+            cancellationToken);
+
+        if (insertedDeliveryId is not null &&
+            riskInput is not null &&
+            riskAssessment is not null)
+        {
+            await InsertOutboxMessageAsync(
+                connection,
+                transaction,
+                ReleaseRiskOutboxEnvelope.Create(
+                    webhook.DeliveryId,
+                    riskInput,
+                    riskAssessment),
+                cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+
+        return insertedDeliveryId is not null;
+    }
+
+    private static async Task<object?> InsertDeliveryAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        VerifiedGitHubWebhook webhook,
+        string disposition,
+        string? riskInputJson,
+        string? riskAssessmentJson,
+        CancellationToken cancellationToken)
+    {
         await using var command = new NpgsqlCommand(
             InsertDeliverySql,
             connection,
@@ -79,10 +135,31 @@ public sealed class PostgreSqlGitHubWebhookDeliveryStore : IGitHubWebhookDeliver
         AddNullableJsonParameter(command, "risk_input", riskInputJson);
         AddNullableJsonParameter(command, "risk_assessment", riskAssessmentJson);
 
-        var insertedDeliveryId = await command.ExecuteScalarAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        return await command.ExecuteScalarAsync(cancellationToken);
+    }
 
-        return insertedDeliveryId is not null;
+    private static async Task InsertOutboxMessageAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        ReleaseRiskOutboxEnvelope envelope,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(
+            InsertOutboxMessageSql,
+            connection,
+            transaction);
+
+        command.Parameters.AddWithValue("event_id", envelope.EventId);
+        command.Parameters.AddWithValue("event_type", envelope.EventType);
+        command.Parameters.AddWithValue("schema_version", envelope.SchemaVersion);
+        command.Parameters.AddWithValue("source_provider", envelope.SourceProvider);
+        command.Parameters.AddWithValue("event_kind", envelope.Kind);
+        command.Parameters.AddWithValue(
+            "envelope",
+            NpgsqlDbType.Jsonb,
+            envelope.Serialize());
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static string? SerializeOrNull<T>(T? value)

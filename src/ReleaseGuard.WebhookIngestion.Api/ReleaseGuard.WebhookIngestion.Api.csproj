@@ -8,5 +8,7 @@
   <ItemGroup>
     <EmbeddedResource Include="Database/Migrations/V001__create_github_webhook_deliveries.sql"
                       LogicalName="ReleaseGuard.Database.Migrations.V001.sql" />
+    <EmbeddedResource Include="Database/Migrations/V002__create_release_risk_outbox.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V002.sql" />
   </ItemGroup>
 </Project>

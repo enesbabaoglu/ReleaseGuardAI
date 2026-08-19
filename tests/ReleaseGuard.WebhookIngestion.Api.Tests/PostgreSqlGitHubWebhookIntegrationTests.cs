@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Npgsql;
 using ReleaseGuard.WebhookIngestion.Api;
 
@@ -43,14 +44,24 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
             await using var command = new NpgsqlCommand(
                 """
                 SELECT
-                    event_name,
-                    payload ->> 'action',
-                    disposition,
-                    risk_input ->> 'kind',
-                    (risk_assessment ->> 'score')::integer,
-                    risk_assessment -> 'factors' -> 0 ->> 'code'
-                FROM github_webhook_deliveries
-                WHERE delivery_id = @delivery_id;
+                    delivery.event_name,
+                    delivery.payload ->> 'action',
+                    delivery.disposition,
+                    delivery.risk_input ->> 'kind',
+                    (delivery.risk_assessment ->> 'score')::integer,
+                    delivery.risk_assessment -> 'factors' -> 0 ->> 'code',
+                    outbox.event_id,
+                    outbox.event_type,
+                    outbox.schema_version,
+                    outbox.source_provider,
+                    outbox.event_kind,
+                    outbox.envelope ->> 'eventId',
+                    delivery.risk_input = outbox.envelope -> 'riskInput',
+                    delivery.risk_assessment = outbox.envelope -> 'riskAssessment'
+                FROM github_webhook_deliveries AS delivery
+                JOIN release_risk_outbox_messages AS outbox
+                    ON outbox.event_id = delivery.delivery_id
+                WHERE delivery.delivery_id = @delivery_id;
                 """,
                 connection);
             command.Parameters.AddWithValue("delivery_id", deliveryId);
@@ -63,6 +74,18 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
             Assert.Equal(GitHubRiskInputMapper.ChangeOpenedKind, reader.GetString(3));
             Assert.Equal(20, reader.GetInt32(4));
             Assert.Equal("primary_target_branch", reader.GetString(5));
+            Assert.Equal(deliveryId, reader.GetGuid(6));
+            Assert.Equal(
+                ReleaseRiskOutboxEnvelope.CurrentEventType,
+                reader.GetString(7));
+            Assert.Equal(
+                ReleaseRiskOutboxEnvelope.CurrentSchemaVersion,
+                reader.GetInt32(8));
+            Assert.Equal("github", reader.GetString(9));
+            Assert.Equal(GitHubRiskInputMapper.ChangeOpenedKind, reader.GetString(10));
+            Assert.Equal(deliveryId.ToString(), reader.GetString(11));
+            Assert.True(reader.GetBoolean(12));
+            Assert.True(reader.GetBoolean(13));
             Assert.False(await reader.ReadAsync());
         }
 
@@ -79,6 +102,7 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
         Assert.NotNull(receipt);
         Assert.Equal("duplicate", receipt.Status);
         Assert.Equal(1, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(1, await CountOutboxMessagesAsync(connectionString));
     }
 
     [Fact]
@@ -105,6 +129,7 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
         Assert.Equal(1, statuses.Count(status => status == HttpStatusCode.Accepted));
         Assert.Equal(19, statuses.Count(status => status == HttpStatusCode.OK));
         Assert.Equal(1, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(1, await CountOutboxMessagesAsync(connectionString));
     }
 
     [Fact]
@@ -158,6 +183,7 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
         Assert.Equal(HttpStatusCode.OK, repeatedResponse.StatusCode);
         Assert.Equal("duplicate", repeatedReceipt?.Status);
         Assert.Equal(1, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(0, await CountOutboxMessagesAsync(connectionString));
     }
 
     [Fact]
@@ -216,12 +242,14 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
         }
 
         Assert.Equal(0, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(0, await CountOutboxMessagesAsync(connectionString));
 
         using var validRetry = CreateRequest(OpenedPayload, invalidSupportedDeliveryId);
         using var validResponse = await client.SendAsync(validRetry);
 
         Assert.Equal(HttpStatusCode.Accepted, validResponse.StatusCode);
         Assert.Equal(1, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(1, await CountOutboxMessagesAsync(connectionString));
     }
 
     [Fact]
@@ -240,6 +268,92 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
             exception.ToString(),
             StringComparison.Ordinal);
         Assert.Equal(0, await CountUserTablesAsync(connectionString));
+    }
+
+    [Fact]
+    public async Task VersionOneDatabase_UpgradesToVersionTwo_WithoutBackfillingOutbox()
+    {
+        var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
+        var existingDeliveryId = Guid.NewGuid();
+        await ApplyVersionOneSchemaAsync(connectionString, existingDeliveryId);
+
+        using (var application = new PostgreSqlTestApplicationFactory(
+                   connectionString,
+                   applyMigrationsOnStartup: true))
+        using (var client = application.CreateClient())
+        using (var response = await client.GetAsync("/health"))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        Assert.Equal(new[] { 1, 2 }, await ReadMigrationVersionsAsync(connectionString));
+        Assert.Equal(1, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(0, await CountOutboxMessagesAsync(connectionString));
+
+        var newDeliveryId = Guid.NewGuid();
+        using var upgradedApplication = new PostgreSqlTestApplicationFactory(
+            connectionString,
+            applyMigrationsOnStartup: false);
+        using var upgradedClient = upgradedApplication.CreateClient();
+        using var request = CreateRequest(OpenedPayload, newDeliveryId);
+        using var acceptedResponse = await upgradedClient.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Accepted, acceptedResponse.StatusCode);
+        Assert.Equal(2, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(1, await CountOutboxMessagesAsync(connectionString));
+    }
+
+    [Fact]
+    public async Task OutboxInsertFailure_RollsBackDeliveryAndOutboxTogether()
+    {
+        var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
+
+        using (var application = new PostgreSqlTestApplicationFactory(
+                   connectionString,
+                   applyMigrationsOnStartup: true))
+        using (var client = application.CreateClient())
+        using (var response = await client.GetAsync("/health"))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        await CreateFailingOutboxTriggerAsync(connectionString);
+
+        var deliveryId = Guid.NewGuid();
+        using var document = JsonDocument.Parse(OpenedPayload);
+        var webhook = new VerifiedGitHubWebhook(
+            deliveryId,
+            "pull_request",
+            document.RootElement.Clone());
+        var riskInput = new ReleaseRiskInput(
+            deliveryId,
+            "github",
+            GitHubRiskInputMapper.ChangeOpenedKind,
+            "acme/ReleaseGuard",
+            42,
+            "Protect production releases",
+            "octocat",
+            "main",
+            "feature/release-guard",
+            false,
+            4,
+            120,
+            15);
+        var riskAssessment = new ReleaseRiskEvaluator().Evaluate(riskInput);
+
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var store = new PostgreSqlGitHubWebhookDeliveryStore(dataSource);
+
+        var exception = await Assert.ThrowsAsync<PostgresException>(
+            () => store.TryAcceptAsync(
+                webhook,
+                riskInput,
+                riskAssessment,
+                CancellationToken.None));
+
+        Assert.Equal("P0001", exception.SqlState);
+        Assert.Equal(0, await CountDeliveriesAsync(connectionString));
+        Assert.Equal(0, await CountOutboxMessagesAsync(connectionString));
     }
 
     private static async Task<HttpStatusCode> SendAsync(
@@ -261,6 +375,128 @@ public sealed class PostgreSqlGitHubWebhookIntegrationTests
             connection);
 
         return (long)(await command.ExecuteScalarAsync() ?? 0L);
+    }
+
+    private static async Task<long> CountOutboxMessagesAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT COUNT(*) FROM release_risk_outbox_messages;",
+            connection);
+
+        return (long)(await command.ExecuteScalarAsync() ?? 0L);
+    }
+
+    private static async Task ApplyVersionOneSchemaAsync(
+        string connectionString,
+        Guid existingDeliveryId)
+    {
+        const string resourceName = "ReleaseGuard.Database.Migrations.V001.sql";
+        await using var migrationStream = typeof(Program).Assembly
+            .GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException(
+                $"Embedded migration '{resourceName}' was not found.");
+        using var migrationReader = new StreamReader(migrationStream);
+        var migrationSql = await migrationReader.ReadToEndAsync();
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+
+        await using (var command = new NpgsqlCommand(
+                         """
+                         CREATE TABLE release_guard_schema_migrations (
+                             version integer PRIMARY KEY,
+                             description text NOT NULL,
+                             applied_at timestamptz NOT NULL DEFAULT transaction_timestamp()
+                         );
+                         """,
+                         connection,
+                         transaction))
+        {
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (var command = new NpgsqlCommand(
+                         migrationSql,
+                         connection,
+                         transaction))
+        {
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (var command = new NpgsqlCommand(
+                         """
+                         INSERT INTO release_guard_schema_migrations (version, description)
+                         VALUES (1, 'create GitHub webhook deliveries');
+
+                         INSERT INTO github_webhook_deliveries (
+                             delivery_id,
+                             event_name,
+                             payload,
+                             disposition,
+                             risk_input,
+                             risk_assessment)
+                         VALUES (
+                             @delivery_id,
+                             'pull_request',
+                             '{"action":"opened"}'::jsonb,
+                             'accepted',
+                             '{}'::jsonb,
+                             '{}'::jsonb);
+                         """,
+                         connection,
+                         transaction))
+        {
+            command.Parameters.AddWithValue("delivery_id", existingDeliveryId);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await transaction.CommitAsync();
+    }
+
+    private static async Task<int[]> ReadMigrationVersionsAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT version FROM release_guard_schema_migrations ORDER BY version;",
+            connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        var versions = new List<int>();
+
+        while (await reader.ReadAsync())
+        {
+            versions.Add(reader.GetInt32(0));
+        }
+
+        return versions.ToArray();
+    }
+
+    private static async Task CreateFailingOutboxTriggerAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            CREATE FUNCTION reject_release_risk_outbox()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $function$
+            BEGIN
+                RAISE EXCEPTION 'forced outbox insert failure';
+            END;
+            $function$;
+
+            CREATE TRIGGER reject_release_risk_outbox_insert
+            BEFORE INSERT ON release_risk_outbox_messages
+            FOR EACH ROW
+            EXECUTE FUNCTION reject_release_risk_outbox();
+            """,
+            connection);
+
+        await command.ExecuteNonQueryAsync();
     }
 
     private static async Task<long> CountUserTablesAsync(string connectionString)

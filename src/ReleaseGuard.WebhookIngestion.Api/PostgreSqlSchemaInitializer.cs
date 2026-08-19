@@ -6,10 +6,20 @@ namespace ReleaseGuard.WebhookIngestion.Api;
 
 public sealed class PostgreSqlSchemaInitializer : IHostedService
 {
-    private const int LatestSchemaVersion = 1;
+    private const int LatestSchemaVersion = 2;
     private const long MigrationLockKey = 7_142_033_117_501_001;
-    private const string MigrationResourceName =
-        "ReleaseGuard.Database.Migrations.V001.sql";
+
+    private static readonly Migration[] Migrations =
+    [
+        new(
+            1,
+            "create GitHub webhook deliveries",
+            "ReleaseGuard.Database.Migrations.V001.sql"),
+        new(
+            2,
+            "create release risk outbox",
+            "ReleaseGuard.Database.Migrations.V002.sql")
+    ];
 
     private const string CreateMigrationTableSql = """
         CREATE TABLE IF NOT EXISTS release_guard_schema_migrations (
@@ -24,9 +34,13 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         FROM release_guard_schema_migrations;
         """;
 
-    private const string VerifyDeliveryTableSql = """
+    private const string VerifyApplicationTablesSql = """
         SELECT 1
         FROM github_webhook_deliveries
+        LIMIT 0;
+
+        SELECT 1
+        FROM release_risk_outbox_messages
         LIMIT 0;
         """;
 
@@ -109,9 +123,14 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
                 $"Database schema version {currentVersion} is newer than supported version {LatestSchemaVersion}.");
         }
 
-        if (currentVersion < LatestSchemaVersion)
+        foreach (var migration in Migrations.Where(
+                     migration => migration.Version > currentVersion))
         {
-            await ApplyVersionOneAsync(connection, transaction, cancellationToken);
+            await ApplyMigrationAsync(
+                connection,
+                transaction,
+                migration,
+                cancellationToken);
         }
 
         await transaction.CommitAsync(cancellationToken);
@@ -120,12 +139,15 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
             LatestSchemaVersion);
     }
 
-    private static async Task ApplyVersionOneAsync(
+    private static async Task ApplyMigrationAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
+        Migration migration,
         CancellationToken cancellationToken)
     {
-        var migrationSql = await ReadMigrationResourceAsync(cancellationToken);
+        var migrationSql = await ReadMigrationResourceAsync(
+            migration.ResourceName,
+            cancellationToken);
 
         await using (var migrationCommand = new NpgsqlCommand(
                          migrationSql,
@@ -138,10 +160,14 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         await using var recordMigrationCommand = new NpgsqlCommand(
             """
             INSERT INTO release_guard_schema_migrations (version, description)
-            VALUES (1, 'create GitHub webhook deliveries');
+            VALUES (@version, @description);
             """,
             connection,
             transaction);
+        recordMigrationCommand.Parameters.AddWithValue("version", migration.Version);
+        recordMigrationCommand.Parameters.AddWithValue(
+            "description",
+            migration.Description);
         await recordMigrationCommand.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -161,7 +187,7 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         }
 
         await using var verifyCommand = new NpgsqlCommand(
-            VerifyDeliveryTableSql,
+            VerifyApplicationTablesSql,
             connection);
         await verifyCommand.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -181,14 +207,20 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
     }
 
     private static async Task<string> ReadMigrationResourceAsync(
+        string resourceName,
         CancellationToken cancellationToken)
     {
         var assembly = Assembly.GetExecutingAssembly();
-        await using var stream = assembly.GetManifestResourceStream(MigrationResourceName)
+        await using var stream = assembly.GetManifestResourceStream(resourceName)
             ?? throw new InvalidOperationException(
-                $"Embedded migration '{MigrationResourceName}' was not found.");
+                $"Embedded migration '{resourceName}' was not found.");
         using var reader = new StreamReader(stream);
 
         return await reader.ReadToEndAsync(cancellationToken);
     }
+
+    private sealed record Migration(
+        int Version,
+        string Description,
+        string ResourceName);
 }
