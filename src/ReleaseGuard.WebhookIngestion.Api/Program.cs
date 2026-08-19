@@ -1,4 +1,6 @@
 using ReleaseGuard.WebhookIngestion.Api;
+using Microsoft.Extensions.Options;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,12 +15,31 @@ builder.Services
         $"{GitHubWebhookOptions.SectionName}:Secret must contain at least {GitHubWebhookOptions.MinimumSecretLength} characters.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<PostgreSqlOptions>()
+    .BindConfiguration(PostgreSqlOptions.SectionName)
+    .Validate(
+        PostgreSqlOptions.HasValidConnectionString,
+        $"{PostgreSqlOptions.SectionName}:ConnectionString must be a valid PostgreSQL connection string with Host and Database.")
+    .ValidateOnStart();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
+builder.Services.AddSingleton<NpgsqlDataSource>(serviceProvider =>
+{
+    var options = serviceProvider
+        .GetRequiredService<IOptions<PostgreSqlOptions>>()
+        .Value;
+    var dataSourceBuilder = new NpgsqlDataSourceBuilder(options.ConnectionString);
+    dataSourceBuilder.UseLoggerFactory(
+        serviceProvider.GetRequiredService<ILoggerFactory>());
+    return dataSourceBuilder.Build();
+});
 builder.Services.AddSingleton<
-    IGitHubWebhookDeliveryRegistry,
-    InMemoryGitHubWebhookDeliveryRegistry>();
+    IGitHubWebhookDeliveryStore,
+    PostgreSqlGitHubWebhookDeliveryStore>();
+builder.Services.AddHostedService<PostgreSqlSchemaInitializer>();
 
 var app = builder.Build();
 

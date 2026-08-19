@@ -172,6 +172,34 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     }
 
     [Fact]
+    public async Task PostWebhook_WhenIgnoredDeliveryIsRepeated_ReturnsDuplicate()
+    {
+        var deliveryId = Guid.NewGuid();
+        var payload = Encoding.UTF8.GetBytes("""{"action":"closed"}""");
+        using var firstRequest = CreateRequest(
+            payload,
+            CreateSignature(payload),
+            deliveryId: deliveryId.ToString());
+        using var repeatedRequest = CreateRequest(
+            payload,
+            CreateSignature(payload),
+            deliveryId: deliveryId.ToString());
+
+        using var firstResponse = await _client.SendAsync(firstRequest);
+        using var repeatedResponse = await _client.SendAsync(repeatedRequest);
+        var repeatedReceipt =
+            await repeatedResponse.Content.ReadFromJsonAsync<GitHubWebhookReceipt>();
+
+        Assert.Equal(HttpStatusCode.Accepted, firstResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, repeatedResponse.StatusCode);
+        Assert.NotNull(repeatedReceipt);
+        Assert.Equal(deliveryId, repeatedReceipt.DeliveryId);
+        Assert.Equal("duplicate", repeatedReceipt.Status);
+        Assert.Null(repeatedReceipt.RiskInput);
+        Assert.Null(repeatedReceipt.RiskAssessment);
+    }
+
+    [Fact]
     public async Task PostWebhook_WithInvalidOpenedPullRequest_DoesNotReserveDeliveryId()
     {
         var deliveryId = Guid.NewGuid();

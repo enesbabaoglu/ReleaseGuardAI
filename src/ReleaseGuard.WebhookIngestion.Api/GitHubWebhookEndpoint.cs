@@ -13,7 +13,7 @@ public static class GitHubWebhookEndpoint
         GitHubWebhookSignatureValidator signatureValidator,
         GitHubRiskInputMapper riskInputMapper,
         ReleaseRiskEvaluator riskEvaluator,
-        IGitHubWebhookDeliveryRegistry deliveryRegistry,
+        IGitHubWebhookDeliveryStore deliveryStore,
         CancellationToken cancellationToken)
     {
         if (!request.Headers.TryGetValue(
@@ -82,7 +82,13 @@ public static class GitHubWebhookEndpoint
             ? riskEvaluator.Evaluate(mappedRiskInput)
             : null;
 
-        if (!deliveryRegistry.TryRegister(webhook))
+        var isNewDelivery = await deliveryStore.TryAcceptAsync(
+            webhook,
+            mappingResult.RiskInput,
+            riskAssessment,
+            cancellationToken);
+
+        if (!isNewDelivery)
         {
             return Results.Ok(GitHubWebhookReceipt.Duplicate(webhook));
         }
