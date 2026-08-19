@@ -104,6 +104,14 @@ builder.Services.AddSingleton<
     IValidateOptions<AiExplanationProcessorOptions>,
     AiExplanationProcessorOptionsValidator>();
 
+builder.Services
+    .AddOptions<AiExplanationQueryOptions>()
+    .BindConfiguration(AiExplanationQueryOptions.SectionName)
+    .Validate(
+        AiExplanationQueryOptions.IsValid,
+        $"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds must be between {AiExplanationQueryOptions.MinimumReadTimeoutMilliseconds} and {AiExplanationQueryOptions.MaximumReadTimeoutMilliseconds}.")
+    .ValidateOnStart();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
@@ -138,6 +146,9 @@ builder.Services.AddSingleton<
 builder.Services.AddSingleton<
     IReleaseRiskExplanationStore,
     PostgreSqlReleaseRiskExplanationStore>();
+builder.Services.AddSingleton<
+    IReleaseRiskExplanationQuery,
+    PostgreSqlReleaseRiskExplanationQuery>();
 builder.Services.AddHostedService<PostgreSqlSchemaInitializer>();
 builder.Services.AddHostedService<ReleaseRiskOutboxDispatcher>();
 builder.Services.AddSingleton<ReleaseRiskInboxProcessor>(serviceProvider =>
@@ -156,6 +167,9 @@ var app = builder.Build();
 
 app.MapGet("/health", () => TypedResults.Ok(ServiceStatus.Ready()));
 app.MapPost(GitHubWebhookEndpoint.Route, GitHubWebhookEndpoint.HandleAsync);
+app.MapGet(
+    ReleaseRiskExplanationQueryEndpoint.Route,
+    ReleaseRiskExplanationQueryEndpoint.HandleAsync);
 
 app.Run();
 

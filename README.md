@@ -2,20 +2,20 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Açıkça etkinleştirilen .NET AI açıklama processor'ı accepted inbox satırlarını bounded claim/lease ile sahiplenir, retryable hataları sınırlı sayıda yeniden dener ve başarıyı ya da kalıcı terminal nedeni aynı `eventId` satırında birbirini ezemeyen sonuçlar olarak saklar. Operatör terminal işleri dar, salt-okunur failed-work sözleşmesinden inceleyebilir. Manual replay, ordering/latest-state, dashboard ve deploy henüz eklenmemiştir.
+Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Açıkça etkinleştirilen .NET AI açıklama processor'ı accepted inbox satırlarını bounded claim/lease ile sahiplenir, retryable hataları sınırlı sayıda yeniden dener ve başarıyı ya da kalıcı terminal nedeni aynı `eventId` satırında birbirini ezemeyen sonuçlar olarak saklar. Operatör terminal işleri dar, salt-okunur failed-work sözleşmesinden inceleyebilir; istemci ise yalnız inbox primary key'i olan `eventId` ile tek olayın `pending`, `completed` veya `failed` AI açıklama durumunu bounded, salt-okunur HTTP query üzerinden okuyabilir. Manual replay, listeleme, ordering/latest-state, dashboard ve deploy henüz eklenmemiştir.
 
 ## Bu adımda ne yapıyoruz?
 
-- V006 ile AI açıklama terminal zamanı, stabil hata kodu ve operatör nedenini doğrudan `release_risk_event_inbox` satırına ekliyoruz. Inbox primary key'i olan `event_id`, kabulden başarı/terminal sonuca kadar tek idempotency sınırıdır.
-- Timeout, bağlantı, `408`, `429`, `5xx` ve beklenmeyen hataları retryable; response/event/request contract ihlalleri ile diğer non-success HTTP durumlarını doğrudan terminal olarak sınıflandırıyoruz.
-- `AiExplanationProcessor:MaximumAttempts` claim sayısını `1–100` arasında sınırlar. Retryable hata son denemede sessizce drop edilmez; aktif owner kalıcı terminal kod/neden yazar. Son claim'den sonra crash olursa expiry sonrası store işi yeniden çağırmadan `attempt_limit_exhausted` olarak sonlandırır.
-- Başarılı açıklama ile terminal failure aynı satırda DB constraint'leri ve fenced store predicate'leriyle karşılıklı dışlanır. Duplicate terminal update aynı `eventId` ve aynı kod/neden için idempotent başarıdır; stale owner mevcut sonucu değiştiremez.
-- `release_risk_ai_explanation_failed_work` görünümü ve bounded `ReadFailedWorkAsync` store sorgusu yalnız terminal işin kimliğini, attempt sayısını, nedenini, kabul zamanını ve immutable V1 envelope'unu gösterir; replay mutasyonu veya API eklemez.
-- Mevcut webhook kabulünü, outbox'ı, Kafka V1 record'unu, durable-accept-then-commit sırasını ve bağımsız Python servis sözleşmesini değiştirmiyoruz.
+- `GET /v1/release-risk-events/{eventId}/ai-explanation` yalnız canonical `D` biçimli GUID ve inbox primary key'i üzerinden tek satırı okur; repository, PR, latest-state, liste veya ordering sorgusu yapmaz.
+- Ayrı `IReleaseRiskExplanationQuery` portu mevcut V006 outcome kolonlarını tek `SELECT` ile `pending`, `completed` veya `failed` durumlarından tam birine dönüştürür. Completed durumda event-bound `eventId`/summary/recommendations, failed durumda mevcut stabil code/reason döner.
+- Pending response sonuç alanı taşımaz; completed response yalnız `explanation`, failed response yalnız `failure` taşır. DTO null alanları JSON'dan çıkarır ve recommendation listesini read-only kopyaya dönüştürür.
+- Bozuk `eventId` için stabil `400`, inbox'ta bulunmayan kimlik için stabil `404`, bounded DB read deadline için ayrıntı sızdırmayan stabil `503` problem sözleşmesi ekliyoruz. Caller/request cancellation timeout veya başarıya çevrilmeden yayılır.
+- `AiExplanationQuery:ReadTimeoutMilliseconds` bağlantı alma, komut yürütme ve sonucu okuma yolunu `100–30000 ms` arasında sınırlar; default `5000 ms` değeridir.
+- Yeni migration veya mutasyon eklemiyoruz; mevcut webhook kabulünü, outbox'ı, Kafka V1 record'unu, durable-accept-then-commit sırasını, AI retry/terminal yaşam döngüsünü ve immutable success/terminal sonuçlarını değiştirmiyoruz.
 
 ## Neden yapıyoruz?
 
-Kalıcı bir provider/contract hatasını sonsuza kadar retry etmek hem maliyeti hem operasyonel gürültüyü sınırsız bırakır; deneme limitinde işi görünmez biçimde bırakmak ise kabul edilmiş event'i kaybetmiş gibi davranır. Bu adım mevcut ownership modelini koruyup her kabulü ya başarıya ya da açık, sorgulanabilir bir terminal sonuca bağlar. Sonuç ile kaynak snapshot aynı satırda kaldığı için açıklama yaşam döngüsü `eventId` üzerinden yarış güvenli olur ve deterministik risk gerçeği değişmez.
+Kalıcı AI sonucu artık DB'de güvenli olsa da istemcinin bunu okuyabilmesi için tabloya veya operatör DLQ görünümüne doğrudan erişmesi doğru sınır değildir. Bu adım tek kabul kimliğini tek query anahtarı olarak kullanıp yaşam döngüsünü küçük ve ayrık bir HTTP sözleşmesine açar. Sorgu yeni domain gerçeği üretmez: pending satır ileride completed/failed olabilir; bir kez kalıcılaşan success veya terminal failure ise mevcut constraint ve fenced update kuralları sayesinde aynı event için değişmez. Böylece okuma yüzeyi retry/ownership ayrıntılarını ya da immutable V1 risk snapshot'ını dışarı açmadan mevcut sonucu gözlemlenebilir kılar.
 
 ## Mimari kararlar
 
@@ -203,6 +203,64 @@ HTTP beklerken veya completion başlamadan önce gözlenen caller/shutdown cance
 
 Operatör sorgusu `release_risk_ai_explanation_failed_work` görünümüdür. Görünüm yalnız `event_id`, attempt/failed zamanı, failure kod/nedeni, `accepted_at` ve immutable `envelope` alanlarını taşır; raw payload, claim token'ı veya mutasyon yüzeyi açmaz. `DISTINCT` tanımı görünümü PostgreSQL seviyesinde doğrudan update edilemez kılar. Store'daki `ReadFailedWorkAsync(limit)` aynı sözleşmeyi `1–100` arasında bounded okur. Migration rol/`GRANT` yönetmez; production'da operatör rolüne yalnız bu görünüm için `SELECT` verilmelidir. Bu checkpoint replay komutu, UI/API, retention, domain ordering veya latest-state eklemez.
 
+### Tek event AI açıklama query sözleşmesi
+
+`GET /v1/release-risk-events/{eventId}/ai-explanation`, `eventId` değerini yalnız canonical tireli GUID (`D`) biçiminde kabul eder. `IReleaseRiskExplanationQuery` repository veya PR alanı kullanmaz; `release_risk_event_inbox.event_id` primary key'iyle en fazla tek satırı ve yalnız outcome kolonlarını okur. Raw Kafka payload'u, V1 envelope, score/factor snapshot'ı, attempt sayısı, claim token'ı ve zamanlar HTTP yanıtına açılmaz.
+
+Pending satır için yanıt tam olarak şu şekildedir:
+
+```json
+{
+  "eventId": "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+  "status": "pending"
+}
+```
+
+Pending; henüz claim edilmemiş, aktif/expired claim taşıyan veya retry backoff'unda bekleyen sonuçsuz satırların hepsini bilinçli olarak tek gözlemlenebilir duruma indirger. Bu endpoint worker sahipliği veya tahmini tamamlanma zamanı sözü vermez.
+
+Completed satır mevcut event-bound açıklamayı değiştirmeden döndürür:
+
+```json
+{
+  "eventId": "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+  "status": "completed",
+  "explanation": {
+    "eventId": "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+    "summary": "The recorded risk ...",
+    "recommendations": ["Review primary_target_branch: ..."]
+  }
+}
+```
+
+Failed satır yalnız mevcut stabil terminal kod/nedeni döndürür:
+
+```json
+{
+  "eventId": "0b989ba4-242f-11e5-81e1-c7b6966d2516",
+  "status": "failed",
+  "failure": {
+    "code": "response_contract_invalid",
+    "reason": "AI explanation response violated the required response contract."
+  }
+}
+```
+
+Üç başarı şekli de `200 OK` döner ve null/alternatif sonuç alanı içermez: pending'de ne `explanation` ne `failure`, completed'da yalnız `explanation`, failed'da yalnız `failure` vardır. Store DB constraint'lerine ek olarak completed explanation'ın iç `eventId` eşleşmesini yeniden doğrular. Response katmanı recommendation listesini read-only kopyalar; her GET tek SQL statement'ının committed snapshot'ıdır ve hiçbir lifecycle alanını update etmez. Pending snapshot ileride başka bir GET'te completed veya failed olabilir; completed ve failed sonuçlar mevcut DB/fencing sözleşmesi gereği kalıcıdır.
+
+Hata sözleşmesi RFC problem JSON'una stabil `code` alanı ekler:
+
+| Durum | HTTP / code | Anlam |
+| --- | --- | --- |
+| Route değeri canonical `D` GUID değil | `400` / `malformed_event_id` | DB sorgusu çalıştırılmaz. |
+| GUID biçimi geçerli fakat inbox satırı yok | `404` / `ai_explanation_not_found` | Kimliğin webhook/outbox geçmişi hakkında ek bilgi verilmez. |
+| `AiExplanationQuery:ReadTimeoutMilliseconds` doldu | `503` / `ai_explanation_query_timeout` | Yokluk veya lifecycle durumu uydurulmaz; istemci daha sonra güvenle tekrar okuyabilir. |
+| Caller/request iptal edildi | HTTP sonucu üretilmez | Cancellation DB komutuna taşınır ve timeout/başarı olarak yeniden sınıflandırılmaz. |
+| Timeout dışı beklenmeyen DB/contract hatası | Framework `5xx` | Bozuk durumu sahte pending/failed yanıtına çevirmek yerine hata görünür kalır. |
+
+Read deadline bağlantı havuzundan bağlantı alma, sorgu yürütme ve row okuma yolunun tamamına aynı linked cancellation token ile uygulanır. Deadline dolduğunda Npgsql komutu iptal edilir; in-flight SELECT herhangi bir mutasyon içermediği için belirsiz write sonucu yoktur. `503`, event'in bulunmadığı veya pending olduğu anlamına gelmez.
+
+Bu endpoint henüz bağımsız bir service-to-service authentication katmanı taşımaz; production'da güvenilen ağ/gateway sınırında tutulmalıdır. UUID tahmin edilmesi zor olsa da tek başına yetkilendirme değildir. Dar authentication sözleşmesi sonraki checkpoint'tir. Query listeleme, polling orchestration, manual replay/mutation, retention, dashboard, deploy kararı veya outbox/Kafka durumu eklemez.
+
 ### Outbox dispatcher claim, retry ve crash semantiği
 
 V003 mevcut outbox tablosuna şu alanları ekler:
@@ -358,6 +416,14 @@ Eksik/geçersiz yapılandırma `releaseguard_ai.main` yüklenirken açıkça sta
 
 Environment değişkenlerinde `:` yerine `__` kullanılır. Processor enabled değilse lifecycle satırları durable pending kalır; bu güvenli default bir başarı veya drop sayılmaz. Enabled instance batch içinde bounded paralellik kullanır. `MaximumAttempts`, aynı event için provider'ın kesin çağrı sayısı değildir: HTTP başlamadan önce crash olan claim de attempt sayılır, timeout sonrası uzak servis çağrıyı işlemiş olabilir. Bu muhafazakâr sınır sonsuz maliyeti engeller; operatör failed-work reason ve envelope üzerinden sonucu inceleyebilir. Jitter ve manual replay yoktur.
 
+### .NET AI açıklama query yapılandırması
+
+| Configuration anahtarı | Kural |
+| --- | --- |
+| `AiExplanationQuery:ReadTimeoutMilliseconds` | Tek event PostgreSQL okumasının tamamı için `100–30000 ms`; default `5000`. |
+
+Environment karşılığı `AiExplanationQuery__ReadTimeoutMilliseconds` değeridir. Sınırın dışındaki değer `ValidateOnStart` ile uygulamayı durdurur. Bu deadline HTTP istemcisinin kendi timeout'undan bağımsızdır; istemci daha kısa sürede bağlantıyı keserse request cancellation önceliklidir ve `503` üretilmez. Timeout artırmak yavaş/kitlenmiş DB'yi sağlıklı hale getirmez; production değeri bağlantı havuzu, normal query latency ve upstream timeout bütçesi birlikte ölçülerek seçilmelidir.
+
 ## Yerel ortam bulguları
 
 İlk incelemede aşağıdaki araçlar doğrulandı:
@@ -404,6 +470,7 @@ ReleaseGuardAI/
 │       ├── AiExplanationClientOptions.cs
 │       ├── AiExplanationFailureClassifier.cs
 │       ├── AiExplanationProcessorOptions.cs
+│       ├── AiExplanationQueryOptions.cs
 │       ├── Database/Migrations/
 │       │   ├── V001__create_github_webhook_deliveries.sql
 │       │   ├── V002__create_release_risk_outbox.sql
@@ -432,6 +499,8 @@ ReleaseGuardAI/
 │       ├── ReleaseRiskInboxStore.cs
 │       ├── ReleaseRiskExplanationClient.cs
 │       ├── ReleaseRiskExplanationProcessor.cs
+│       ├── ReleaseRiskExplanationQuery.cs
+│       ├── ReleaseRiskExplanationQueryEndpoint.cs
 │       ├── ReleaseRiskExplanationStore.cs
 │       ├── ReleaseRiskOutboxDispatcher.cs
 │       ├── ReleaseRiskOutboxEnvelope.cs
@@ -442,6 +511,7 @@ ReleaseGuardAI/
         ├── AiExplanationClientOptionsTests.cs
         ├── AiExplanationFailureClassifierTests.cs
         ├── AiExplanationProcessorOptionsTests.cs
+        ├── AiExplanationQueryOptionsTests.cs
         ├── GitHubWebhookEndpointTests.cs
         ├── HealthEndpointTests.cs
         ├── HttpReleaseRiskExplanationClientTests.cs
@@ -451,6 +521,7 @@ ReleaseGuardAI/
         ├── KafkaReleaseRiskEventConsumerIntegrationTests.cs
         ├── KafkaReleaseRiskEventProducerIntegrationTests.cs
         ├── OutboxDispatcherOptionsTests.cs
+        ├── PostgreSqlAiExplanationQueryIntegrationTests.cs
         ├── PostgreSqlAiExplanationProcessorIntegrationTests.cs
         ├── PostgreSqlGitHubWebhookIntegrationTests.cs
         ├── PostgreSqlInboxProcessorIntegrationTests.cs
@@ -459,6 +530,7 @@ ReleaseGuardAI/
         ├── PostgreSqlTestApplicationFactory.cs
         ├── PythonAiExplanationContractIntegrationTests.cs
         ├── ReleaseRiskEvaluatorTests.cs
+        ├── ReleaseRiskExplanationQueryEndpointTests.cs
         ├── ReleaseRiskExplanationProcessorTests.cs
         ├── ReleaseRiskInboxProcessorOptionsTests.cs
         ├── ReleaseRiskInboxProcessorTests.cs
@@ -582,6 +654,12 @@ Yalnız AI açıklama processor options/unit testleriyle gerçek PostgreSQL owne
 dotnet test tests/ReleaseGuard.WebhookIngestion.Api.Tests --filter FullyQualifiedName~ExplanationProcessor
 ```
 
+Yalnız AI açıklama query options/HTTP birim testleriyle gerçek PostgreSQL status, immutable read, timeout ve cancellation senaryolarını çalıştırmak için:
+
+```bash
+dotnet test tests/ReleaseGuard.WebhookIngestion.Api.Tests --filter FullyQualifiedName~ExplanationQuery
+```
+
 ### Yerel Kafka-compatible broker
 
 Checked-in compose dosyası Linux/amd64 ve Linux/arm64 imajı bulunan, Kafka protokolüyle uyumlu tek Redpanda broker'ı `localhost:19092` üzerinde başlatır. Veriler container ile birlikte silinebilir yerel/test verisidir:
@@ -653,6 +731,7 @@ export AiExplanationProcessor__InitialRetryDelayMilliseconds=1000
 export AiExplanationProcessor__MaximumRetryDelayMilliseconds=60000
 export AiExplanationProcessor__MaximumAttempts=5
 export AiExplanationProcessor__StateUpdateTimeoutMilliseconds=5000
+export AiExplanationQuery__ReadTimeoutMilliseconds=5000
 dotnet run --project src/ReleaseGuard.WebhookIngestion.Api -- --urls http://localhost:5080
 ```
 
@@ -663,7 +742,7 @@ export PostgreSql__ApplyMigrationsOnStartup=false
 dotnet run --project src/ReleaseGuard.WebhookIngestion.Api -- --urls http://localhost:5080
 ```
 
-Migration bayrağı hiç verilmezse `false` kabul edilir. V006'ya ulaşmamış veritabanında false ile açılış bilinçli olarak başarısızdır; şema kendiliğinden veya bellek fallback'iyle oluşturulmaz. Kafka producer/consumer bootstrap servers, aynı topic, consumer group ID, bounded consume/broker request timeout'u ile dispatcher/inbox processor sınırları eksik veya geçersizse uygulama options validation ile startup'ta durur. `OutboxDispatcher__Enabled`, `InboxProcessor__Enabled` ve `AiExplanationProcessor__Enabled` verilmezse güvenli default `false` olur; pending outbox yayımlanmaz, consumer client oluşturulup record okunmaz ve accepted inbox satırları AI için claim edilmez. Dispatcher publish hatalarını kalıcı capped backoff'a dönüştürür. AI processor retryable hataları configured attempt sınırına kadar backoff ile dener; terminal sınıfları ve son retryable denemeyi kalıcı failed state'e taşır. Inbox processor etkin olduğunda ilk güvenli olmayan DB/contract/commit hatası worker'ı durdurur; Kafka offset commit'i AI çağrısını beklemez.
+Migration bayrağı hiç verilmezse `false` kabul edilir. V006'ya ulaşmamış veritabanında false ile açılış bilinçli olarak başarısızdır; şema kendiliğinden veya bellek fallback'iyle oluşturulmaz. Kafka producer/consumer bootstrap servers, aynı topic, consumer group ID, bounded consume/broker request timeout'u ile dispatcher/inbox processor ve AI query read-timeout sınırları eksik veya geçersizse uygulama options validation ile startup'ta durur. `OutboxDispatcher__Enabled`, `InboxProcessor__Enabled` ve `AiExplanationProcessor__Enabled` verilmezse güvenli default `false` olur; pending outbox yayımlanmaz, consumer client oluşturulup record okunmaz ve accepted inbox satırları AI için claim edilmez. Query endpoint'i worker enable bayraklarından bağımsız olarak mevcut committed inbox satırını salt-okunur okuyabilir. Dispatcher publish hatalarını kalıcı capped backoff'a dönüştürür. AI processor retryable hataları configured attempt sınırına kadar backoff ile dener; terminal sınıfları ve son retryable denemeyi kalıcı failed state'e taşır. Inbox processor etkin olduğunda ilk güvenli olmayan DB/contract/commit hatası worker'ı durdurur; Kafka offset commit'i AI çağrısını beklemez.
 
 Başka bir terminalden sağlık kontrolü:
 
@@ -676,6 +755,15 @@ Beklenen sağlık yanıtı:
 ```json
 {"status":"ok","service":"webhook-ingestion"}
 ```
+
+Durable inbox'a kabul edilmiş belirli bir olayın AI açıklama durumunu okumak için:
+
+```bash
+curl --fail-with-body \
+  http://localhost:5080/v1/release-risk-events/0b989ba4-242f-11e5-81e1-c7b6966d2516/ai-explanation
+```
+
+Bu çağrı yalnız o `eventId` için yukarıdaki pending/completed/failed şekillerinden birini döndürür. Inbox'a henüz kabul edilmemiş outbox/Kafka olayı `404` olur; query endpoint'i onu beklemez, publish etmez veya replay etmez.
 
 GitHub webhook ayarında payload URL'sini `/webhooks/github`, content type'ı `application/json` ve secret'i uygulamaya verilen değerle aynı ayarlayın. GitHub her teslimatta gerekli `X-Hub-Signature-256`, `X-GitHub-Delivery` ve `X-GitHub-Event` başlıklarını gönderir. Geçerli bir `pull_request` / `synchronize` teslimatının örnek yanıtı şöyledir:
 
@@ -800,21 +888,21 @@ Bu sorgu yalnız terminal işleri okur; pending/başarılı işleri, raw Kafka p
 
 Bu adım aşağıdaki sırayla doğrulanır:
 
-1. V006 migration testinin mevcut V004→V005 pending işi kaybetmeden terminal alan/constraint/index ve salt-okunur failed-work görünümüne yükseltmesi; startup'ın exact V006 şemasını doğrulaması.
-2. Processor options ve classifier testlerinin bounded `MaximumAttempts` değerini, retryable/terminal hata matrisini, capped exponential backoff'u ve enabled lease > HTTP timeout + state-update timeout bağıntısını doğrulaması.
-3. Processor unit testlerinin başarı, retryable timeout, doğrudan terminal conflict, son-attempt terminalization, caller cancellation ve stale completion yollarını çalıştırması.
-4. Gerçek PostgreSQL 16 testlerinin eşzamanlı ownership, timeout/backoff, cancellation, crash/restart limit sonlandırması, stale owner fencing, terminal duplicate idempotency, başarı/terminal karşılıklı dışlama, duplicate inbox kabulü, read-only DLQ sorgusu ve değişmeyen score/level/factor snapshot'ını doğrulaması.
-5. Mevcut deterministic fake HTTP server ve gerçek local Uvicorn .NET→Python contract testlerinin transport/response sözleşmesini değişmeden koruması.
+1. Query options testlerinin `100–30000 ms` read-timeout sınırlarını; HTTP birim testlerinin pending/completed/failed JSON alan kümelerini, canonical event ID girdisini, stabil `400/404/503` problem code'larını ve caller cancellation ayrımını doğrulaması.
+2. Response testinin completed recommendations kaynağını read-only kopyaya dönüştürmesi ve farklı event'e bağlı explanation'ı reddetmesi.
+3. Gerçek PostgreSQL 16 testinin pending satırı okuması, aynı primary key'i success ve terminal sonuçlara taşıması, event-bound explanation ile stabil failure code/reason döndürmesi ve tekrarlı GET boyunca raw payload/envelope dahil bütün saklı snapshot/lifecycle kolonlarının byte/semantik değerlerini değiştirmemesi.
+4. Gerçek PostgreSQL tablo kilidi altında endpoint deadline'ının bounded `503` üretip kilit kalkınca aynı satırı yeniden okuyabilmesi; doğrudan query cancellation'ının `OperationCanceledException` olarak yayılması.
+5. Mevcut V001–V006 migration, webhook, outbox, Kafka producer/consumer, durable inbox, AI processor/DLQ, deterministic fake HTTP server ve gerçek local Uvicorn .NET→Python contract testlerinin değişmeden geçmesi.
 6. Python Ruff lint/format ve Python 3.9 bytecode compile kontrolleri, tüm Python testleri, `.NET format`, restore, warning-as-error build ve gerçek PostgreSQL/Redpanda dahil tüm .NET testlerinin tamamlanması; entegrasyon testlerinin Docker yokken sessizce atlanmaması.
 
-Son doğrulamada Python Ruff lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; deterministic fake server, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `213/213 başarılı, 0 atlanan` sonucunu verdi. Toplam `255` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
+Son doğrulamada Python Ruff lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; deterministic fake server, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `232/232 başarılı, 0 atlanan` sonucunu verdi. Toplam `274` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
 
 ## Sıradaki küçük adım
 
-Bu adım durable inbox sonrası AI açıklama retry, başarı ve terminal failed-work sınırında durur. Sonraki tek küçük adım yalnız `eventId` ile tek olayın AI açıklama durumunu okuyan dar bir HTTP query sözleşmesi olmalıdır:
+Bu adım yalnız `eventId` ile tek olayın AI açıklama durumunu okuyan dar HTTP query sınırında durur. Sonraki tek küçük adım sadece bu GET yüzeyine service-to-service kimlik doğrulama eklemek olmalıdır:
 
-- `pending`, `completed` veya `failed` durumlarından tam birini, başarıda mevcut açıklamayı, failure'da mevcut stabil kod/nedeni döndürmek.
-- Inbox primary key'i dışındaki repository/PR latest-state veya listeleme/ordering anlamını eklememek.
-- Manual replay/mutation, dashboard, deploy, retention ve outbox/Kafka yaşam döngüsünü kapsam dışında tutmak.
+- Query credential'ını kod/README/appsettings içine yazmadan configuration/secret provider'dan almak; eksik yapılandırmada fail-fast davranmak.
+- Eksik veya geçersiz credential için ayrıntı sızdırmayan stabil `401`, geçerli credential için mevcut `200/400/404/503` body sözleşmesini aynen korumak; `/health` ve imzalı GitHub webhook akışını değiştirmemek.
+- Kullanıcı/tenant modeli, rol matrisi, listeleme, ordering/latest-state, manual replay/mutation, dashboard, deploy, retention veya outbox/Kafka yaşam döngüsü eklememek.
 
-Sonraki checkpoint mevcut webhook kabulü, outbox yayını, Kafka V1 sözleşmesi, durable-accept-then-commit sırası ve immutable success/terminal sonuçlarını değiştirmemelidir.
+Sonraki checkpoint mevcut V006 şemasını, webhook kabulünü, outbox yayını, Kafka V1 sözleşmesini, durable-accept-then-commit sırasını ve immutable success/terminal sonuçlarını değiştirmemelidir.

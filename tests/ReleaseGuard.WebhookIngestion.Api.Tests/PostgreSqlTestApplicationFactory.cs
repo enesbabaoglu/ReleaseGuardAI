@@ -9,13 +9,16 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
 {
     private readonly string _connectionString;
     private readonly bool _applyMigrationsOnStartup;
+    private readonly int _queryReadTimeoutMilliseconds;
 
     public PostgreSqlTestApplicationFactory(
         string connectionString,
-        bool applyMigrationsOnStartup)
+        bool applyMigrationsOnStartup,
+        int queryReadTimeoutMilliseconds = 5_000)
     {
         _connectionString = connectionString;
         _applyMigrationsOnStartup = applyMigrationsOnStartup;
+        _queryReadTimeoutMilliseconds = queryReadTimeoutMilliseconds;
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -41,7 +44,10 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                 [$"{KafkaConsumerOptions.SectionName}:GroupId"] =
                     "releaseguard-postgresql-tests",
                 [$"{AiExplanationClientOptions.SectionName}:BaseUrl"] =
-                    "http://127.0.0.1:8090"
+                    "http://127.0.0.1:8090",
+                [$"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds"] =
+                    _queryReadTimeoutMilliseconds.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture)
             });
         });
     }
