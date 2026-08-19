@@ -1,15 +1,14 @@
 using System.Net;
 using System.Net.Http.Json;
-using Microsoft.AspNetCore.Mvc.Testing;
 using ReleaseGuard.WebhookIngestion.Api;
 
 namespace ReleaseGuard.WebhookIngestion.Api.Tests;
 
-public sealed class HealthEndpointTests : IClassFixture<WebApplicationFactory<Program>>
+public sealed class HealthEndpointTests : IClassFixture<TestApplicationFactory>
 {
     private readonly HttpClient _client;
 
-    public HealthEndpointTests(WebApplicationFactory<Program> application)
+    public HealthEndpointTests(TestApplicationFactory application)
     {
         _client = application.CreateClient();
     }
