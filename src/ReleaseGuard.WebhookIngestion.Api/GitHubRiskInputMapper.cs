@@ -5,7 +5,10 @@ namespace ReleaseGuard.WebhookIngestion.Api;
 public sealed class GitHubRiskInputMapper
 {
     public const string SupportedEventName = "pull_request";
-    public const string SupportedAction = "opened";
+    public const string OpenedAction = "opened";
+    public const string SynchronizeAction = "synchronize";
+    public const string ChangeOpenedKind = "change_opened";
+    public const string ChangeUpdatedKind = "change_updated";
 
     public GitHubRiskInputMappingResult Map(VerifiedGitHubWebhook webhook)
     {
@@ -24,7 +27,14 @@ public sealed class GitHubRiskInputMapper
             return GitHubRiskInputMappingResult.Invalid();
         }
 
-        if (!string.Equals(action, SupportedAction, StringComparison.Ordinal))
+        var kind = action switch
+        {
+            OpenedAction => ChangeOpenedKind,
+            SynchronizeAction => ChangeUpdatedKind,
+            _ => null
+        };
+
+        if (kind is null)
         {
             return GitHubRiskInputMappingResult.Unsupported();
         }
@@ -51,7 +61,7 @@ public sealed class GitHubRiskInputMapper
         var riskInput = new ReleaseRiskInput(
             webhook.DeliveryId,
             SourceProvider: "github",
-            Kind: "change_opened",
+            Kind: kind,
             repositoryName,
             changeNumber,
             title,
