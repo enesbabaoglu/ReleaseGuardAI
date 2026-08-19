@@ -39,7 +39,9 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                 [$"{KafkaConsumerOptions.SectionName}:Topic"] =
                     "releaseguard.release-risk-assessed-tests",
                 [$"{KafkaConsumerOptions.SectionName}:GroupId"] =
-                    "releaseguard-postgresql-tests"
+                    "releaseguard-postgresql-tests",
+                [$"{AiExplanationClientOptions.SectionName}:BaseUrl"] =
+                    "http://127.0.0.1:8090"
             });
         });
     }

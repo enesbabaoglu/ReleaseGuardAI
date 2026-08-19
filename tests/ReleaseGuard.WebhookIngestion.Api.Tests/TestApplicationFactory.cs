@@ -32,7 +32,9 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
                 [$"{KafkaConsumerOptions.SectionName}:Topic"] =
                     "releaseguard.release-risk-assessed-tests",
                 [$"{KafkaConsumerOptions.SectionName}:GroupId"] =
-                    "releaseguard-webhook-unit-tests"
+                    "releaseguard-webhook-unit-tests",
+                [$"{AiExplanationClientOptions.SectionName}:BaseUrl"] =
+                    "http://127.0.0.1:8090"
             });
         });
 

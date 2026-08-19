@@ -85,9 +85,23 @@ builder.Services
         $"{ReleaseRiskInboxProcessorOptions.SectionName}:PersistenceTimeoutMilliseconds must be between {ReleaseRiskInboxProcessorOptions.MinimumPersistenceTimeoutMilliseconds} and {ReleaseRiskInboxProcessorOptions.MaximumPersistenceTimeoutMilliseconds}.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<AiExplanationClientOptions>()
+    .BindConfiguration(AiExplanationClientOptions.SectionName)
+    .Validate(
+        AiExplanationClientOptions.HasValidBaseUrl,
+        $"{AiExplanationClientOptions.SectionName}:BaseUrl must be an absolute HTTP or HTTPS URL without credentials, query, or fragment.")
+    .Validate(
+        AiExplanationClientOptions.HasValidRequestTimeout,
+        $"{AiExplanationClientOptions.SectionName}:RequestTimeoutMilliseconds must be between {AiExplanationClientOptions.MinimumRequestTimeoutMilliseconds} and {AiExplanationClientOptions.MaximumRequestTimeoutMilliseconds}.")
+    .ValidateOnStart();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
+builder.Services.AddHttpClient<
+    IReleaseRiskExplanationClient,
+    HttpReleaseRiskExplanationClient>();
 builder.Services.AddSingleton<
     IReleaseRiskEventProducer,
     KafkaReleaseRiskEventProducer>();

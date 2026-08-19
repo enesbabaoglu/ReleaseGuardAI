@@ -2,19 +2,20 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir; servis henüz .NET consumer/inbox akışından çağrılmaz. Inbox sonrası işleme yaşam döngüsü, ordering/latest-state ve dashboard henüz eklenmemiştir.
+Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Bağımsız .NET HTTP client adapter'ı typed V1 snapshot'ı bu servise aynen gönderip event-bound yanıtı doğrular; client henüz consumer veya inbox akışından çağrılmaz. Inbox sonrası işleme yaşam döngüsü, ordering/latest-state ve dashboard henüz eklenmemiştir.
 
 ## Bu adımda ne yapıyoruz?
 
-- Python 3.9 uyumlu bağımsız FastAPI projesi, `/health` ve tek sürümlü `POST /v1/release-risk-explanations` endpoint'ini ekliyoruz; .NET uygulamasının çalışma yolunu değiştirmiyoruz.
-- İstek modelini mevcut yedi alanlı V1 `releaseguard.release-risk-assessed` envelope'uyla sınırlandırıyor; type/version, `eventId`/`sourceDeliveryId`, provider ve kind eşleşmelerini doğruluyoruz. Ek veya eksik alanlar reddedilir.
-- Yanıtı yalnız `eventId`, `summary` ve `recommendations` alanlarıyla tutuyoruz. Mevcut score/level/factor snapshot'ı provider'a aynen verilir; servis bunları yeniden hesaplamaz, değiştirmez veya yeni deployment kararı üretmez.
-- `fake` ve genel `http-json` provider adapter'larını configuration üzerinden seçiyoruz. HTTP provider bounded timeout kullanır; provider hatasını `502`, timeout'u `504` yapar, cancellation'ı yutmaz ve kendi retry döngüsünü eklemez.
-- Ortak checked-in V1 fixture'ı hem .NET deterministik serializer testinde hem Python contract testinde kullanıyoruz. Python unit/API/provider testleri gerçek ücretli modele veya ağa ihtiyaç duymaz.
+- Küçük `IReleaseRiskExplanationClient` portunu ve `HttpReleaseRiskExplanationClient` adapter'ını ekliyoruz. Base URL ile `100–60000 ms` bounded request timeout configuration/options üzerinden gelir ve startup'ta doğrulanır.
+- Adapter mevcut typed V1 `ReleaseRiskOutboxEnvelope.SerializeToUtf8Bytes()` çıktısını `POST /v1/release-risk-explanations` gövdesi olarak doğrudan yollar; score, level veya factor alanlarını yeniden hesaplamaz ya da değiştirmez.
+- Başarılı yanıtı yalnız `eventId`, `summary` ve `recommendations` alanlarıyla kabul eder; ek/eksik/bozuk alanları reddeder ve response `eventId` değerinin request event ID'siyle eşleşmesini zorunlu kılar.
+- Non-2xx, sözleşme hatası, event ID conflict, timeout ve caller cancellation çağırana ayrı ve test edilebilir hata yollarıyla taşınır. Adapter hata yutmaz veya internal retry döngüsü çalıştırmaz.
+- Deterministic ASP.NET Core fake HTTP server testlerinin yanında gerçek local Uvicorn process'ini `fake` provider ile başlatan tek .NET→Python contract testi ekliyoruz; dış ağ veya ücretli provider kullanılmaz.
+- Client'ı Kafka consumer veya inbox processor akışına bağlamıyor; mevcut webhook, outbox, Kafka, durable inbox ve Python davranışlarını koruyoruz.
 
 ## Neden yapıyoruz?
 
-Deterministik risk skoru ürün politikasına aittir; AI provider'ın aynı olayı yeniden puanlaması güvenilir sözleşmeyi bulanıklaştırırdı. Bu adım AI kullanımını yalnız mevcut snapshot'ın insan-okunur açıklamasına sınırlar. Ayrı servis ve provider portu, ücretli/uzak modele bağlanmadan contract, hata ve cancellation davranışını test etmeyi sağlar. .NET inbox ile HTTP çağrısı arasında henüz işleme/yeniden deneme yaşam döngüsü tanımlanmadığı için iki bileşen bu checkpoint'te bilinçli olarak bağlanmaz.
+Deterministik risk skoru ürün politikasına aittir; AI provider'ın aynı olayı yeniden puanlaması güvenilir sözleşmeyi bulanıklaştırırdı. Bu adım .NET→Python taşıma sınırını exact snapshot ve event identity üzerinden ayrı test edilebilir hale getirir. Inbox sonrası sahiplik, kalıcı sonuç, yeniden deneme ve crash recovery yaşam döngüsü henüz tanımlanmadığı için client'ı çalışan consumer akışına bağlamak güvenilir olmayan bir yan etki üretirdi; iki bileşen bu checkpoint'te bilinçli olarak bağımsız kalır.
 
 ## Mimari kararlar
 
@@ -266,6 +267,16 @@ Buradaki `envelope` kısaltılmadan doğrulanmış V1 nesnesinin tamamıdır. Pr
 
 Tüm provider türleri endpoint seviyesinde `RELEASEGUARD_AI_TIMEOUT_SECONDS` ile bound edilir. HTTP transport timeout'u veya genel provider süresinin aşılması `504 Gateway Timeout`; bağlantı, non-2xx veya response-contract hatası ayrıntı sızdırmayan `502 Bad Gateway` üretir. İstek iptali başarıya veya 5xx'e çevrilmez; çalışan provider coroutine'i iptal edilir ve cancellation çağırana yayılır. Servis internal retry yapmaz. Retry/idempotency kararı, inbox sonrası kalıcı işleme yaşam döngüsü tanımlandığında event ID üzerinden ayrıca ele alınmalıdır.
 
+### .NET AI açıklama HTTP client sözleşmesi
+
+`IReleaseRiskExplanationClient.ExplainAsync`, yalnız mevcut typed `ReleaseRiskOutboxEnvelope` ile caller `CancellationToken` değerini alır. HTTP adapter önce envelope'un mevcut V1 identity/provider/kind tutarlılığını doğrular, ardından `SerializeToUtf8Bytes()` çıktısını değiştirmeden `application/json; charset=utf-8` gövdesi olarak yapılandırılmış base URL altındaki `v1/release-risk-explanations` yoluna gönderir. Ayrı bir request DTO'su veya AI'ya özgü score modeli yoktur; risk input, score, level ve factor snapshot'ları Python sınırına mevcut halleriyle ulaşır.
+
+Yanıt JSON'u tam olarak `eventId`, `summary` ve `recommendations` alanlarıyla sınırlandırılır. Geçersiz JSON, ek/eksik alan veya boş içerik `ReleaseRiskExplanationContractException`; request ile response kimliği farklıysa bunun özel alt türü `ReleaseRiskExplanationEventIdConflictException` olur. Non-2xx `HttpRequestException` ve status code ile taşınır. Bu hataların hiçbiri başarıya çevrilmez.
+
+Adapter request ve response-body okumasının tamamını `AiExplanationClient:RequestTimeoutMilliseconds` ile bound eder. Yapılandırılmış deadline aşılırsa `TimeoutException`, caller token iptal edilirse `OperationCanceledException` yayılır; caller cancellation timeout gibi yeniden sınıflandırılmaz. In-flight timeout/cancellation sırasında Python isteği işlemiş olabilir. Client internal retry yapmadığı için duplicate üretmez, fakat ileride çağıracak kalıcı processor belirsiz sonucu aynı `eventId` üzerinden idempotent ele almak zorundadır.
+
+Client DI'a typed `HttpClient` olarak kaydedilir fakat bu checkpoint'te hiçbir hosted service, Kafka consumer veya inbox processor onu resolve edip çağırmaz. Python endpoint'i kendi başına authentication header istemediği için .NET client credential taşımaz. İleride gateway authentication gerekirse token/header kod veya appsettings içine yazılmamalı; configuration/secret provider üzerinden alınmalıdır.
+
 ### AI servis yapılandırması
 
 | Environment değişkeni | Kural |
@@ -277,6 +288,15 @@ Tüm provider türleri endpoint seviyesinde `RELEASEGUARD_AI_TIMEOUT_SECONDS` il
 | `RELEASEGUARD_AI_PROVIDER_API_KEY` | `http-json` için zorunlu; yalnız environment/secret provider üzerinden verilir. |
 
 Eksik/geçersiz yapılandırma `releaseguard_ai.main` yüklenirken açıkça startup hatası üretir; sessiz fake fallback yoktur. Repoda credential veya çalışan provider default'u bulunmaz. `/health` yalnız process/API sağlığını bildirir ve uzak provider'ı çağırmaz; model sağlayıcısının erişilebilirlik kanıtı değildir.
+
+### .NET AI client yapılandırması
+
+| Configuration anahtarı | Kural |
+| --- | --- |
+| `AiExplanationClient:BaseUrl` | Zorunlu absolute HTTP/HTTPS base URL. Credential, query veya fragment taşıyamaz. Local örnek: `http://127.0.0.1:8090`. |
+| `AiExplanationClient:RequestTimeoutMilliseconds` | `100–60000` aralığında bounded tam request süresi; default `5000`. |
+
+.NET environment değişkeni eşlemesi için sırasıyla `AiExplanationClient__BaseUrl` ve `AiExplanationClient__RequestTimeoutMilliseconds` kullanılır. Base URL bilinçli olarak boş default'a sahiptir; yanlış ortamın bilinmeyen bir endpoint'e sessizce bağlanması yerine `ValidateOnStart` uygulamayı durdurur.
 
 ## Yerel ortam bulguları
 
@@ -303,6 +323,8 @@ ReleaseGuardAI/
 ├── Directory.Build.props
 ├── global.json
 ├── ReleaseGuard.sln
+├── scripts/
+│   └── test-dotnet-python-contract.sh
 ├── src/
 │   ├── ReleaseGuard.AiExplanation.Api/
 │   │   ├── pyproject.toml
@@ -319,6 +341,7 @@ ReleaseGuardAI/
 │   │       ├── test_providers.py
 │   │       └── test_settings.py
 │   └── ReleaseGuard.WebhookIngestion.Api/
+│       ├── AiExplanationClientOptions.cs
 │       ├── Database/Migrations/
 │       │   ├── V001__create_github_webhook_deliveries.sql
 │       │   ├── V002__create_release_risk_outbox.sql
@@ -343,14 +366,17 @@ ReleaseGuardAI/
 │       ├── ReleaseRiskInboxProcessor.cs
 │       ├── ReleaseRiskInboxProcessorOptions.cs
 │       ├── ReleaseRiskInboxStore.cs
+│       ├── ReleaseRiskExplanationClient.cs
 │       ├── ReleaseRiskOutboxDispatcher.cs
 │       ├── ReleaseRiskOutboxEnvelope.cs
 │       ├── ReleaseRiskOutboxStore.cs
 │       └── VerifiedGitHubWebhook.cs
 └── tests/
     └── ReleaseGuard.WebhookIngestion.Api.Tests/
+        ├── AiExplanationClientOptionsTests.cs
         ├── GitHubWebhookEndpointTests.cs
         ├── HealthEndpointTests.cs
+        ├── HttpReleaseRiskExplanationClientTests.cs
         ├── KafkaIntegrationFixture.cs
         ├── KafkaConsumerOptionsTests.cs
         ├── KafkaProducerOptionsTests.cs
@@ -362,6 +388,7 @@ ReleaseGuardAI/
         ├── PostgreSqlIntegrationFixture.cs
         ├── PostgreSqlOutboxDispatcherIntegrationTests.cs
         ├── PostgreSqlTestApplicationFactory.cs
+        ├── PythonAiExplanationContractIntegrationTests.cs
         ├── ReleaseRiskEvaluatorTests.cs
         ├── ReleaseRiskInboxProcessorOptionsTests.cs
         ├── ReleaseRiskInboxProcessorTests.cs
@@ -407,6 +434,14 @@ PYTHONPYCACHEPREFIX=/tmp/releaseguard-pycache \
 
 Bağımlılıkların doğrudan sürümleri `pyproject.toml` içinde sabittir. `.venv`, Python cache'leri ve editable-install metadata'sı git tarafından yok sayılır.
 
+Python sanal ortamı kurulduktan sonra gerçek local Uvicorn process'iyle tek .NET→Python V1 contract testini depo kökünden çalıştırmak için:
+
+```bash
+scripts/test-dotnet-python-contract.sh
+```
+
+Script yalnız ilgili xUnit testini seçer. Test boş bir loopback portu ayırır, `.venv/bin/python -m uvicorn` process'ini `fake` provider ile başlatır, production .NET adapter'ıyla ortak checked-in V1 fixture'ı endpoint'e gönderir ve process'i sonunda kapatır. `RELEASEGUARD_AI_PYTHON` ile farklı bir Python executable seçilebilir; test dış ağa veya ücretli provider'a başvurmaz.
+
 Local/test deterministic provider ile servisi çalıştırmak için aynı klasörde:
 
 ```bash
@@ -416,6 +451,15 @@ export RELEASEGUARD_AI_TIMEOUT_SECONDS='5'
 .venv/bin/uvicorn releaseguard_ai.main:app \
   --host 127.0.0.1 --port 8090
 ```
+
+Bağımsız .NET client yapılandırmasının aynı local servisi göstermesi için webhook host ortamında:
+
+```bash
+export AiExplanationClient__BaseUrl='http://127.0.0.1:8090'
+export AiExplanationClient__RequestTimeoutMilliseconds='5000'
+```
+
+Bu ayarlar yalnız client registration'ını hazırlar; mevcut Kafka consumer/inbox akışı HTTP çağrısı yapmaz.
 
 Başka bir terminalden `curl http://127.0.0.1:8090/health` çağrısı `{"status":"ok","service":"ai-explanation"}` döndürmelidir. Açıklama endpoint'ine request body olarak ortak fixture gönderilebilir. Aşağıdaki komut AI servis klasöründen çalıştırılır:
 
@@ -643,24 +687,21 @@ Inbox satırının varlığı V1 Kafka record'unun PostgreSQL'e durable kabul ed
 
 Bu adım aşağıdaki sırayla doğrulanır:
 
-1. Python kaynaklarının Ruff lint/format ve Python 3.9 bytecode compile kontrolünden geçmesi.
-2. Python V1 modelinin ortak .NET fixture'ını alan kaybı/değişimi olmadan kabul etmesi; yanlış type/version/identity/provider/kind, ek ve eksik alanları reddetmesi.
-3. API testlerinin health, başarılı event-bound response, `422` contract reddi, `502` provider hatası, bounded `504` timeout ve request cancellation davranışını çalıştırması.
-4. Provider testlerinin deterministic fake çıktısını ve HTTP adapter'ın model/auth/exact envelope request'ini; non-2xx, invalid response, transport timeout ve cancellation yollarını ağ/ücretli model kullanmadan çalıştırması.
-5. .NET ortak fixture testinin mevcut serializer'ın deterministik string/UTF-8 byte çıktısını koruduğunu kanıtlaması.
-6. `dotnet format`, restore ve warning-as-error solution build'inin mevcut .NET davranışını koruması.
-7. Mevcut 145 testin gerçek PostgreSQL 16 ve Redpanda Testcontainers senaryoları dahil tamamının yeniden çalışması; entegrasyon testlerinin Docker yokken sessizce atlanmaması.
+1. Options testlerinin safe absolute base URL ile `100–60000 ms` timeout sınırlarını doğrulaması.
+2. Deterministic ASP.NET Core fake HTTP server testlerinin exact V1 request byte'ları ve başarılı yanıtın yanında malformed/invalid response, event ID conflict, tek-attempt non-2xx, timeout ve caller cancellation yollarını çalıştırması.
+3. Gerçek local Uvicorn process'li cross-service testin production .NET adapter'ından Python `fake` provider endpoint'ine ortak fixture'ı göndermesi ve event-bound V1 yanıtı kabul etmesi.
+4. Mevcut Python kaynaklarının Ruff lint/format ve Python 3.9 bytecode compile kontrolünden, tüm API/contract/provider/settings testlerinin de değişmeden geçmesi.
+5. `dotnet format`, restore ve warning-as-error solution build'inin mevcut .NET davranışını koruması.
+6. Gerçek PostgreSQL 16 ve Redpanda Testcontainers senaryoları dahil tüm .NET testlerinin tamamlanması; entegrasyon testlerinin Docker yokken sessizce atlanmaması.
 
-Son doğrulamada Python lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. Local Uvicorn smoke testinde hem `/health` hem ortak V1 fixture ile açıklama endpoint'i `200` döndü. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; ortak fixture testi ile gerçek PostgreSQL 16 ve Redpanda senaryoları dahil mevcut .NET testleri `145/145 başarılı, 0 atlanan` sonucunu verdi. Toplam `187` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi gerekir; PostgreSQL veya Kafka broker yokken entegrasyon testleri sessizce atlanmaz.
+Son doğrulamada Python lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; deterministic fake server, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `164/164 başarılı, 0 atlanan` sonucunu verdi. Toplam `206` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
 
 ## Sıradaki küçük adım
 
-Bu adım burada durur. Sonraki küçük adım yalnız bağımsız .NET AI açıklama HTTP client adapter'ı sınırıdır:
+Bu adım bağımsız .NET→Python HTTP taşıma sınırında durur. Sonraki küçük adım yalnız durable inbox sonrası AI açıklama işleme yaşam döngüsü olmalıdır:
 
-- Base URL ve bounded request timeout'unu options/configuration üzerinden alan küçük bir `IReleaseRiskExplanationClient` ve HTTP adapter'ı oluşturmak; credential/header gerekiyorsa repoya yazmadan configuration'dan almak.
-- Adapter'a mevcut typed V1 `ReleaseRiskOutboxEnvelope` vermek, aynı snapshot'ı Python endpoint'ine göndermek ve response `eventId` değerinin request event ID'siyle eşleşmesini zorunlu kılmak; score/level/factor alanlarını değiştirmemek.
-- Başarı, yanlış/malformed response, event ID conflict, non-2xx, timeout ve cancellation davranışını deterministic fake HTTP server ile test etmek; hata yutmamak veya internal sonsuz retry eklememek.
-- Python servisinin gerçek local HTTP process'iyle tek cross-service contract entegrasyon testi için tekrarlanabilir komut sağlamak; ücretli provider'a veya dış ağa ihtiyaç duymamak.
-- Client'ı bu checkpoint'te Kafka consumer veya inbox processor akışından çağırmamak; inbox `processed` lifecycle, claim/lease, retry/backoff, DLQ, ordering/latest-state, dashboard veya deploy eklememek.
+- Inbox'ta accepted payload ile açıklama sonucu arasındaki kalıcı state/ownership sözleşmesini ve event ID idempotency sınırını migration/store seviyesinde tanımlamak.
+- Bounded claim/lease ve retry/backoff davranışını açıkça belirledikten sonra mevcut `IReleaseRiskExplanationClient` çağrısını bu sahipliğin içine almak; timeout/cancellation sonrası belirsiz sonucu event ID üzerinden güvenle yeniden ele almak.
+- Başarılı event-bound açıklamayı score/level/factor snapshot'ını değiştirmeden kalıcılaştırmak; ancak DLQ/max-attempt sonlandırması, ordering/latest-state, dashboard ve deploy'u yine eklememek.
 
-Sonraki checkpoint mevcut webhook, outbox, Kafka ve durable inbox davranışını değiştirmemeli ve yalnız bağımsız .NET→Python HTTP taşıma sınırında durmalıdır.
+Sonraki checkpoint mevcut webhook kabulü, outbox yayını, Kafka V1 sözleşmesi ve durable-accept-then-commit sırasını değiştirmemelidir.
