@@ -17,5 +17,7 @@
                       LogicalName="ReleaseGuard.Database.Migrations.V004.sql" />
     <EmbeddedResource Include="Database/Migrations/V005__add_release_risk_ai_explanation_lifecycle.sql"
                       LogicalName="ReleaseGuard.Database.Migrations.V005.sql" />
+    <EmbeddedResource Include="Database/Migrations/V006__add_release_risk_ai_explanation_terminal_lifecycle.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V006.sql" />
   </ItemGroup>
 </Project>

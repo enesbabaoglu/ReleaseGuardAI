@@ -30,6 +30,7 @@ public sealed class ReleaseRiskExplanationProcessor : BackgroundService
             claimOwner,
             _options.BatchSize,
             TimeSpan.FromMilliseconds(_options.LeaseDurationMilliseconds),
+            _options.MaximumAttempts,
             cancellationToken);
 
         await Task.WhenAll(claims.Select(
@@ -119,6 +120,33 @@ public sealed class ReleaseRiskExplanationProcessor : BackgroundService
         }
         catch (Exception exception)
         {
+            var failure = AiExplanationFailureClassifier.Classify(exception);
+            if (failure.Disposition == AiExplanationFailureDisposition.Terminal ||
+                claim.AttemptCount >= _options.MaximumAttempts)
+            {
+                var terminalFailure =
+                    AiExplanationFailureClassifier.ToTerminalFailure(
+                        failure,
+                        claim.AttemptCount,
+                        _options.MaximumAttempts);
+                var markedTerminal = await TryStateUpdateAsync(
+                    token => _store.MarkTerminalAsync(
+                        claim,
+                        terminalFailure,
+                        token),
+                    claim,
+                    "mark terminal failure");
+
+                _logger.LogError(
+                    exception,
+                    "Generating release risk explanation {EventId} reached terminal failure {FailureCode} on attempt {AttemptCount}: {TerminalStateRecorded}.",
+                    claim.EventId,
+                    terminalFailure.Code,
+                    claim.AttemptCount,
+                    markedTerminal);
+                return;
+            }
+
             var retryDelay = AiExplanationProcessorOptions.CalculateRetryDelay(
                 _options,
                 claim.AttemptCount);

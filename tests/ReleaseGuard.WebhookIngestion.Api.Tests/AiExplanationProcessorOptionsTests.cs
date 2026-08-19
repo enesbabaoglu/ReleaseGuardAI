@@ -11,22 +11,26 @@ public sealed class AiExplanationProcessorOptionsTests
         var options = new AiExplanationProcessorOptions();
 
         Assert.False(options.Enabled);
+        Assert.Equal(5, options.MaximumAttempts);
         Assert.True(AiExplanationProcessorOptions.IsValid(options));
     }
 
     [Theory]
-    [InlineData(0, 1_000, 30_000, 1_000, 60_000, 5_000)]
-    [InlineData(10, 99, 30_000, 1_000, 60_000, 5_000)]
-    [InlineData(10, 1_000, 999, 1_000, 60_000, 100)]
-    [InlineData(10, 1_000, 30_000, 99, 60_000, 5_000)]
-    [InlineData(10, 1_000, 30_000, 60_001, 60_000, 5_000)]
-    [InlineData(10, 1_000, 30_000, 1_000, 60_000, 30_000)]
+    [InlineData(0, 1_000, 30_000, 1_000, 60_000, 5, 5_000)]
+    [InlineData(10, 99, 30_000, 1_000, 60_000, 5, 5_000)]
+    [InlineData(10, 1_000, 999, 1_000, 60_000, 5, 100)]
+    [InlineData(10, 1_000, 30_000, 99, 60_000, 5, 5_000)]
+    [InlineData(10, 1_000, 30_000, 60_001, 60_000, 5, 5_000)]
+    [InlineData(10, 1_000, 30_000, 1_000, 60_000, 0, 5_000)]
+    [InlineData(10, 1_000, 30_000, 1_000, 60_000, 101, 5_000)]
+    [InlineData(10, 1_000, 30_000, 1_000, 60_000, 5, 30_000)]
     public void InvalidBounds_AreRejected(
         int batchSize,
         int pollInterval,
         int leaseDuration,
         int initialRetryDelay,
         int maximumRetryDelay,
+        int maximumAttempts,
         int stateUpdateTimeout)
     {
         var options = new AiExplanationProcessorOptions
@@ -36,6 +40,7 @@ public sealed class AiExplanationProcessorOptionsTests
             LeaseDurationMilliseconds = leaseDuration,
             InitialRetryDelayMilliseconds = initialRetryDelay,
             MaximumRetryDelayMilliseconds = maximumRetryDelay,
+            MaximumAttempts = maximumAttempts,
             StateUpdateTimeoutMilliseconds = stateUpdateTimeout
         };
 

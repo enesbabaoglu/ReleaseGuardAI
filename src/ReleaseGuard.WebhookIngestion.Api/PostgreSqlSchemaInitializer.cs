@@ -6,7 +6,7 @@ namespace ReleaseGuard.WebhookIngestion.Api;
 
 public sealed class PostgreSqlSchemaInitializer : IHostedService
 {
-    private const int LatestSchemaVersion = 5;
+    private const int LatestSchemaVersion = 6;
     private const long MigrationLockKey = 7_142_033_117_501_001;
 
     private static readonly Migration[] Migrations =
@@ -30,7 +30,11 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         new(
             5,
             "add release risk AI explanation lifecycle",
-            "ReleaseGuard.Database.Migrations.V005.sql")
+            "ReleaseGuard.Database.Migrations.V005.sql"),
+        new(
+            6,
+            "add release risk AI explanation terminal lifecycle",
+            "ReleaseGuard.Database.Migrations.V006.sql")
     ];
 
     private const string CreateMigrationTableSql = """
@@ -74,8 +78,22 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
             explanation_claimed_by,
             explanation_claim_expires_at,
             explanation_completed_at,
-            explanation
+            explanation,
+            explanation_failed_at,
+            explanation_failure_code,
+            explanation_failure_reason
         FROM release_risk_event_inbox
+        LIMIT 0;
+
+        SELECT
+            event_id,
+            attempt_count,
+            failed_at,
+            failure_code,
+            failure_reason,
+            accepted_at,
+            envelope
+        FROM release_risk_ai_explanation_failed_work
         LIMIT 0;
         """;
 

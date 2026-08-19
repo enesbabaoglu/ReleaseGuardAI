@@ -221,7 +221,7 @@ public sealed class PostgreSqlOutboxDispatcherIntegrationTests
         Assert.Null(state.ClaimExpiresAt);
         Assert.True(state.NextAttemptAt <= DateTimeOffset.UtcNow);
         Assert.Equal(
-            new[] { 1, 2, 3, 4, 5 },
+            new[] { 1, 2, 3, 4, 5, 6 },
             await ReadMigrationVersionsAsync(connectionString));
         Assert.Equal(0, await CountInboxEventsAsync(connectionString));
     }

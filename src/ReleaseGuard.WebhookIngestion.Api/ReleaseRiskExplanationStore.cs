@@ -11,12 +11,26 @@ public sealed record ReleaseRiskExplanationClaim(
     int AttemptCount,
     ReleaseRiskOutboxEnvelope Envelope);
 
+public sealed record ReleaseRiskExplanationTerminalFailure(
+    string Code,
+    string Reason);
+
+public sealed record ReleaseRiskExplanationFailedWork(
+    Guid EventId,
+    int AttemptCount,
+    DateTimeOffset FailedAt,
+    string FailureCode,
+    string FailureReason,
+    DateTimeOffset AcceptedAt,
+    ReleaseRiskOutboxEnvelope Envelope);
+
 public interface IReleaseRiskExplanationStore
 {
     Task<IReadOnlyList<ReleaseRiskExplanationClaim>> ClaimPendingAsync(
         string claimOwner,
         int batchSize,
         TimeSpan leaseDuration,
+        int maximumAttempts,
         CancellationToken cancellationToken);
 
     Task<bool> MarkCompletedAsync(
@@ -29,8 +43,17 @@ public interface IReleaseRiskExplanationStore
         TimeSpan retryDelay,
         CancellationToken cancellationToken);
 
+    Task<bool> MarkTerminalAsync(
+        ReleaseRiskExplanationClaim claim,
+        ReleaseRiskExplanationTerminalFailure failure,
+        CancellationToken cancellationToken);
+
     Task<bool> ReleaseClaimAsync(
         ReleaseRiskExplanationClaim claim,
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<ReleaseRiskExplanationFailedWork>> ReadFailedWorkAsync(
+        int limit,
         CancellationToken cancellationToken);
 }
 
@@ -40,11 +63,41 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web);
 
+    public const int MaximumFailedWorkQueryLimit = 100;
+
+    private const string TerminalizeExhaustedSql = """
+        WITH candidates AS (
+            SELECT event_id
+            FROM release_risk_event_inbox
+            WHERE explanation_completed_at IS NULL
+              AND explanation_failed_at IS NULL
+              AND explanation_attempt_count >= @maximum_attempts
+              AND explanation_next_attempt_at <= clock_timestamp()
+              AND (
+                  explanation_claimed_by IS NULL
+                  OR explanation_claim_expires_at <= clock_timestamp())
+            ORDER BY explanation_next_attempt_at, accepted_at, event_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT @batch_size
+        )
+        UPDATE release_risk_event_inbox AS inbox
+        SET
+            explanation_failed_at = clock_timestamp(),
+            explanation_failure_code = @failure_code,
+            explanation_failure_reason = @failure_reason,
+            explanation_claimed_by = NULL,
+            explanation_claim_expires_at = NULL
+        FROM candidates
+        WHERE inbox.event_id = candidates.event_id;
+        """;
+
     private const string ClaimPendingSql = """
         WITH candidates AS (
             SELECT event_id
             FROM release_risk_event_inbox
             WHERE explanation_completed_at IS NULL
+              AND explanation_failed_at IS NULL
+              AND explanation_attempt_count < @maximum_attempts
               AND explanation_next_attempt_at <= clock_timestamp()
               AND (
                   explanation_claimed_by IS NULL
@@ -76,7 +129,9 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             explanation_claim_expires_at = NULL
         WHERE event_id = @event_id
           AND explanation_completed_at IS NULL
+          AND explanation_failed_at IS NULL
           AND explanation_claimed_by = @claim_owner
+          AND explanation_attempt_count = @attempt_count
           AND explanation_claim_expires_at > clock_timestamp()
         RETURNING event_id;
         """;
@@ -89,9 +144,39 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             explanation_claim_expires_at = NULL
         WHERE event_id = @event_id
           AND explanation_completed_at IS NULL
+          AND explanation_failed_at IS NULL
           AND explanation_claimed_by = @claim_owner
+          AND explanation_attempt_count = @attempt_count
           AND explanation_claim_expires_at > clock_timestamp()
         RETURNING event_id;
+        """;
+
+    private const string MarkTerminalSql = """
+        WITH applied AS (
+            UPDATE release_risk_event_inbox
+            SET
+                explanation_failed_at = clock_timestamp(),
+                explanation_failure_code = @failure_code,
+                explanation_failure_reason = @failure_reason,
+                explanation_claimed_by = NULL,
+                explanation_claim_expires_at = NULL
+            WHERE event_id = @event_id
+              AND explanation_completed_at IS NULL
+              AND explanation_failed_at IS NULL
+              AND explanation_claimed_by = @claim_owner
+              AND explanation_attempt_count = @attempt_count
+              AND explanation_claim_expires_at > clock_timestamp()
+            RETURNING event_id
+        )
+        SELECT EXISTS(SELECT 1 FROM applied)
+            OR EXISTS(
+                SELECT 1
+                FROM release_risk_event_inbox
+                WHERE event_id = @event_id
+                  AND explanation_completed_at IS NULL
+                  AND explanation_failed_at IS NOT NULL
+                  AND explanation_failure_code = @failure_code
+                  AND explanation_failure_reason = @failure_reason);
         """;
 
     private const string ReleaseClaimSql = """
@@ -104,8 +189,24 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             explanation_claim_expires_at = NULL
         WHERE event_id = @event_id
           AND explanation_completed_at IS NULL
+          AND explanation_failed_at IS NULL
           AND explanation_claimed_by = @claim_owner
+          AND explanation_attempt_count = @attempt_count
         RETURNING event_id;
+        """;
+
+    private const string ReadFailedWorkSql = """
+        SELECT
+            event_id,
+            attempt_count,
+            failed_at,
+            failure_code,
+            failure_reason,
+            accepted_at,
+            envelope::text
+        FROM release_risk_ai_explanation_failed_work
+        ORDER BY failed_at, event_id
+        LIMIT @limit;
         """;
 
     private readonly NpgsqlDataSource _dataSource;
@@ -119,11 +220,47 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         string claimOwner,
         int batchSize,
         TimeSpan leaseDuration,
+        int maximumAttempts,
         CancellationToken cancellationToken)
     {
-        ValidateClaimRequest(claimOwner, batchSize, leaseDuration);
+        ValidateClaimRequest(
+            claimOwner,
+            batchSize,
+            leaseDuration,
+            maximumAttempts);
 
-        await using var command = _dataSource.CreateCommand(ClaimPendingSql);
+        await using var connection = await _dataSource.OpenConnectionAsync(
+            cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(
+            cancellationToken);
+        await using (var exhaustedCommand = new NpgsqlCommand(
+                         TerminalizeExhaustedSql,
+                         connection,
+                         transaction))
+        {
+            exhaustedCommand.Parameters.AddWithValue(
+                "maximum_attempts",
+                NpgsqlDbType.Integer,
+                maximumAttempts);
+            exhaustedCommand.Parameters.AddWithValue(
+                "batch_size",
+                NpgsqlDbType.Integer,
+                batchSize);
+            exhaustedCommand.Parameters.AddWithValue(
+                "failure_code",
+                NpgsqlDbType.Text,
+                AiExplanationFailureClassifier.AttemptLimitExhaustedCode);
+            exhaustedCommand.Parameters.AddWithValue(
+                "failure_reason",
+                NpgsqlDbType.Text,
+                "Configured maximum attempt count was reached before a result was persisted.");
+            await exhaustedCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using var command = new NpgsqlCommand(
+            ClaimPendingSql,
+            connection,
+            transaction);
         command.Parameters.AddWithValue(
             "claim_owner",
             NpgsqlDbType.Text,
@@ -136,6 +273,10 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             "lease_duration",
             NpgsqlDbType.Interval,
             leaseDuration);
+        command.Parameters.AddWithValue(
+            "maximum_attempts",
+            NpgsqlDbType.Integer,
+            maximumAttempts);
 
         await using var reader = await command.ExecuteReaderAsync(
             cancellationToken);
@@ -151,6 +292,9 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             ValidateClaim(claim);
             claims.Add(claim);
         }
+
+        await reader.DisposeAsync();
+        await transaction.CommitAsync(cancellationToken);
 
         return claims;
     }
@@ -175,6 +319,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             claim,
             explanation,
             retryDelay: null,
+            failure: null,
             cancellationToken);
     }
 
@@ -195,6 +340,24 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             claim,
             explanation: null,
             retryDelay,
+            failure: null,
+            cancellationToken);
+    }
+
+    public Task<bool> MarkTerminalAsync(
+        ReleaseRiskExplanationClaim claim,
+        ReleaseRiskExplanationTerminalFailure failure,
+        CancellationToken cancellationToken)
+    {
+        ValidateClaim(claim);
+        ValidateTerminalFailure(failure);
+
+        return ExecuteClaimUpdateAsync(
+            MarkTerminalSql,
+            claim,
+            explanation: null,
+            retryDelay: null,
+            failure,
             cancellationToken);
     }
 
@@ -208,7 +371,39 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             claim,
             explanation: null,
             retryDelay: null,
+            failure: null,
             cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ReleaseRiskExplanationFailedWork>>
+        ReadFailedWorkAsync(
+            int limit,
+            CancellationToken cancellationToken)
+    {
+        if (limit is < 1 or > MaximumFailedWorkQueryLimit)
+        {
+            throw new ArgumentOutOfRangeException(nameof(limit));
+        }
+
+        await using var command = _dataSource.CreateCommand(ReadFailedWorkSql);
+        command.Parameters.AddWithValue("limit", NpgsqlDbType.Integer, limit);
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken);
+        var failedWork = new List<ReleaseRiskExplanationFailedWork>();
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            failedWork.Add(new ReleaseRiskExplanationFailedWork(
+                reader.GetGuid(0),
+                reader.GetInt32(1),
+                reader.GetFieldValue<DateTimeOffset>(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetFieldValue<DateTimeOffset>(5),
+                ReleaseRiskOutboxEnvelope.Deserialize(reader.GetString(6))));
+        }
+
+        return failedWork;
     }
 
     private async Task<bool> ExecuteClaimUpdateAsync(
@@ -216,6 +411,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         ReleaseRiskExplanationClaim claim,
         ReleaseRiskExplanation? explanation,
         TimeSpan? retryDelay,
+        ReleaseRiskExplanationTerminalFailure? failure,
         CancellationToken cancellationToken)
     {
         await using var command = _dataSource.CreateCommand(sql);
@@ -224,6 +420,10 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             "claim_owner",
             NpgsqlDbType.Text,
             claim.ClaimOwner);
+        command.Parameters.AddWithValue(
+            "attempt_count",
+            NpgsqlDbType.Integer,
+            claim.AttemptCount);
 
         if (explanation is not null)
         {
@@ -241,13 +441,32 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
                 retryDelay.Value);
         }
 
-        return await command.ExecuteScalarAsync(cancellationToken) is not null;
+        if (failure is not null)
+        {
+            command.Parameters.AddWithValue(
+                "failure_code",
+                NpgsqlDbType.Text,
+                failure.Code);
+            command.Parameters.AddWithValue(
+                "failure_reason",
+                NpgsqlDbType.Text,
+                failure.Reason);
+        }
+
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return result switch
+        {
+            bool applied => applied,
+            null => false,
+            _ => true
+        };
     }
 
     private static void ValidateClaimRequest(
         string claimOwner,
         int batchSize,
-        TimeSpan leaseDuration)
+        TimeSpan leaseDuration,
+        int maximumAttempts)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(claimOwner);
 
@@ -266,6 +485,32 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         if (leaseDuration <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        }
+
+        if (maximumAttempts is < 1 or > AiExplanationProcessorOptions.MaximumAllowedAttempts)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumAttempts));
+        }
+    }
+
+    private static void ValidateTerminalFailure(
+        ReleaseRiskExplanationTerminalFailure failure)
+    {
+        ArgumentNullException.ThrowIfNull(failure);
+
+        if (string.IsNullOrWhiteSpace(failure.Code) ||
+            failure.Code.Length > 64 ||
+            !char.IsAsciiLetterLower(failure.Code[0]) ||
+            failure.Code.Any(character =>
+                !(char.IsAsciiLetterLower(character) ||
+                  char.IsAsciiDigit(character) ||
+                  character == '_')) ||
+            string.IsNullOrWhiteSpace(failure.Reason) ||
+            Encoding.UTF8.GetByteCount(failure.Reason) > 1024)
+        {
+            throw new ArgumentException(
+                "Terminal failure must contain a bounded snake-case code and a non-empty bounded reason.",
+                nameof(failure));
         }
     }
 

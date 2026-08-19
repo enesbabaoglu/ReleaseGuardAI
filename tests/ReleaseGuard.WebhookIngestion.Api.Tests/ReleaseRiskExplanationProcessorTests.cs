@@ -28,20 +28,13 @@ public sealed class ReleaseRiskExplanationProcessorTests
         Assert.False(store.Released);
     }
 
-    [Theory]
-    [InlineData("timeout")]
-    [InlineData("conflict")]
-    public async Task RetryableFailure_SchedulesExplicitBackoff(string failure)
+    [Fact]
+    public async Task RetryableFailure_BeforeAttemptLimit_SchedulesExplicitBackoff()
     {
         var claim = CreateClaim(attemptCount: 3);
         var store = new RecordingStore(claim);
-        var client = new DelegateClient((_, _) => failure switch
-        {
-            "timeout" => throw new TimeoutException("Simulated timeout."),
-            _ => throw new ReleaseRiskExplanationEventIdConflictException(
-                claim.EventId,
-                Guid.NewGuid())
-        });
+        var client = new DelegateClient((_, _) =>
+            throw new TimeoutException("Simulated timeout."));
         using var processor = CreateProcessor(store, client);
 
         var processed = await processor.ProcessPendingBatchAsync(
@@ -50,8 +43,53 @@ public sealed class ReleaseRiskExplanationProcessorTests
         Assert.Equal(1, processed);
         Assert.True(store.MarkedFailed);
         Assert.Equal(TimeSpan.FromSeconds(4), store.RetryDelay);
+        Assert.Null(store.TerminalFailure);
         Assert.Null(store.CompletedExplanation);
         Assert.False(store.Released);
+    }
+
+    [Fact]
+    public async Task TerminalContractFailure_BypassesRetryAndPersistsReason()
+    {
+        var claim = CreateClaim();
+        var store = new RecordingStore(claim);
+        var client = new DelegateClient((_, _) =>
+            throw new ReleaseRiskExplanationEventIdConflictException(
+                claim.EventId,
+                Guid.NewGuid()));
+        using var processor = CreateProcessor(store, client);
+
+        Assert.Equal(
+            1,
+            await processor.ProcessPendingBatchAsync(CancellationToken.None));
+
+        Assert.False(store.MarkedFailed);
+        Assert.Equal(
+            AiExplanationFailureClassifier.EventIdConflictCode,
+            store.TerminalFailure?.Code);
+        Assert.Equal(
+            "AI explanation response event ID did not match the claimed event.",
+            store.TerminalFailure?.Reason);
+    }
+
+    [Fact]
+    public async Task RetryableFailure_AtAttemptLimit_BecomesTerminal()
+    {
+        var claim = CreateClaim(attemptCount: 5);
+        var store = new RecordingStore(claim);
+        var client = new DelegateClient((_, _) =>
+            throw new TimeoutException("Simulated timeout."));
+        using var processor = CreateProcessor(store, client);
+
+        Assert.Equal(
+            1,
+            await processor.ProcessPendingBatchAsync(CancellationToken.None));
+
+        Assert.False(store.MarkedFailed);
+        Assert.Equal(
+            AiExplanationFailureClassifier.RequestTimeoutCode,
+            store.TerminalFailure?.Code);
+        Assert.Contains("maximum of 5 attempts", store.TerminalFailure?.Reason);
     }
 
     [Fact]
@@ -133,6 +171,7 @@ public sealed class ReleaseRiskExplanationProcessorTests
                 LeaseDurationMilliseconds = 30_000,
                 InitialRetryDelayMilliseconds = 1_000,
                 MaximumRetryDelayMilliseconds = 60_000,
+                MaximumAttempts = 5,
                 StateUpdateTimeoutMilliseconds = 1_000
             }),
             NullLogger<ReleaseRiskExplanationProcessor>.Instance);
@@ -214,6 +253,12 @@ public sealed class ReleaseRiskExplanationProcessorTests
 
         public bool MarkedFailed { get; private set; }
 
+        public ReleaseRiskExplanationTerminalFailure? TerminalFailure
+        {
+            get;
+            private set;
+        }
+
         public TimeSpan? RetryDelay { get; private set; }
 
         public bool Released { get; private set; }
@@ -222,9 +267,11 @@ public sealed class ReleaseRiskExplanationProcessorTests
             string claimOwner,
             int batchSize,
             TimeSpan leaseDuration,
+            int maximumAttempts,
             CancellationToken cancellationToken)
         {
             ClaimCalls++;
+            Assert.Equal(5, maximumAttempts);
             IReadOnlyList<ReleaseRiskExplanationClaim> claims = [_claim];
             return Task.FromResult(claims);
         }
@@ -249,6 +296,15 @@ public sealed class ReleaseRiskExplanationProcessorTests
             return Task.FromResult(true);
         }
 
+        public Task<bool> MarkTerminalAsync(
+            ReleaseRiskExplanationClaim claim,
+            ReleaseRiskExplanationTerminalFailure failure,
+            CancellationToken cancellationToken)
+        {
+            TerminalFailure = failure;
+            return Task.FromResult(true);
+        }
+
         public Task<bool> ReleaseClaimAsync(
             ReleaseRiskExplanationClaim claim,
             CancellationToken cancellationToken)
@@ -256,5 +312,12 @@ public sealed class ReleaseRiskExplanationProcessorTests
             Released = true;
             return Task.FromResult(true);
         }
+
+        public Task<IReadOnlyList<ReleaseRiskExplanationFailedWork>>
+            ReadFailedWorkAsync(
+                int limit,
+                CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ReleaseRiskExplanationFailedWork>>(
+                []);
     }
 }

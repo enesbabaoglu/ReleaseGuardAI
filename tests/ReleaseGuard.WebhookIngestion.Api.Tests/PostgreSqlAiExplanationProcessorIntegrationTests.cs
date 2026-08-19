@@ -63,11 +63,13 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
                 "first-processor",
                 1,
                 TimeSpan.FromSeconds(30),
+                5,
                 CancellationToken.None),
             secondStore.ClaimPendingAsync(
                 "second-processor",
                 1,
                 TimeSpan.FromSeconds(30),
+                5,
                 CancellationToken.None));
 
         Assert.Equal(1, claims.Sum(result => result.Count));
@@ -89,12 +91,14 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
             "crashed-processor",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
 
         Assert.Empty(await secondStore.ClaimPendingAsync(
             "replacement-before-expiry",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
 
         await ExpireClaimAsync(connectionString, envelope.EventId);
@@ -102,6 +106,7 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
             "replacement-after-expiry",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
         var staleExplanation = CreateExplanation(envelope.EventId, "stale");
         var recoveredExplanation = CreateExplanation(
@@ -123,22 +128,15 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         Assert.Equal(2, state.AttemptCount);
     }
 
-    [Theory]
-    [InlineData("timeout")]
-    [InlineData("event-conflict")]
-    public async Task ClientFailure_PersistsBoundedRetryWithoutResult(
-        string failure)
+    [Fact]
+    public async Task RetryableClientFailure_PersistsBoundedRetryWithoutResult()
     {
         var connectionString = await CreateInitializedDatabaseAsync();
         var envelope = await AcceptEnvelopeAsync(connectionString);
         await using var dataSource = NpgsqlDataSource.Create(connectionString);
         var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
-        IReleaseRiskExplanationClient client = failure switch
-        {
-            "timeout" => new ThrowingClient(
-                new TimeoutException("Simulated request timeout.")),
-            _ => new InvalidResultClient(Guid.NewGuid())
-        };
+        IReleaseRiskExplanationClient client = new ThrowingClient(
+            new TimeoutException("Simulated request timeout."));
         using var processor = CreateProcessor(
             store,
             client,
@@ -155,11 +153,13 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         Assert.Null(state.Explanation);
         Assert.Null(state.ClaimedBy);
         Assert.Null(state.ClaimExpiresAt);
+        Assert.Null(state.FailedAt);
         Assert.True(state.NextAttemptAt > DateTimeOffset.UtcNow.AddSeconds(2));
         Assert.Empty(await store.ClaimPendingAsync(
             "too-early-retry",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
     }
 
@@ -183,6 +183,7 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
             "replacement-after-cancellation",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
         Assert.Equal(envelope.EventId, replay.EventId);
         Assert.Equal(2, replay.AttemptCount);
@@ -201,6 +202,7 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
             "complete-before-duplicate",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
         Assert.True(await explanationStore.MarkCompletedAsync(
             claim,
@@ -219,11 +221,328 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
             "must-not-reprocess-completed",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
     }
 
     [Fact]
-    public async Task VersionFourInbox_UpgradesInPlaceAsPendingExplanationWork()
+    public async Task TerminalFailure_IsDurableQueryableAndDuplicateAcceptanceDoesNotResetIt()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var inboxStore = new PostgreSqlReleaseRiskInboxStore(dataSource);
+        var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
+        using var processor = CreateProcessor(
+            store,
+            new ThrowingClient(
+                new ReleaseRiskExplanationEventIdConflictException(
+                    envelope.EventId,
+                    Guid.NewGuid())));
+
+        Assert.Equal(
+            1,
+            await processor.ProcessPendingBatchAsync(CancellationToken.None));
+        Assert.Equal(
+            ReleaseRiskInboxAcceptance.Duplicate,
+            await inboxStore.AcceptAsync(
+                CreateConsumedEvent(envelope, offset: 1),
+                CancellationToken.None));
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Null(state.CompletedAt);
+        Assert.Null(state.Explanation);
+        Assert.NotNull(state.FailedAt);
+        Assert.Equal(
+            AiExplanationFailureClassifier.EventIdConflictCode,
+            state.FailureCode);
+        Assert.Equal(
+            "AI explanation response event ID did not match the claimed event.",
+            state.FailureReason);
+        Assert.Null(state.ClaimedBy);
+        Assert.Null(state.ClaimExpiresAt);
+        Assert.Empty(await store.ClaimPendingAsync(
+            "must-not-reprocess-terminal",
+            1,
+            TimeSpan.FromSeconds(30),
+            5,
+            CancellationToken.None));
+
+        var failed = Assert.Single(await store.ReadFailedWorkAsync(
+            10,
+            CancellationToken.None));
+        Assert.Equal(envelope.EventId, failed.EventId);
+        Assert.Equal(1, failed.AttemptCount);
+        Assert.Equal(state.FailedAt, failed.FailedAt);
+        Assert.Equal(state.FailureCode, failed.FailureCode);
+        Assert.Equal(state.FailureReason, failed.FailureReason);
+        Assert.Equal(envelope.Serialize(), failed.Envelope.Serialize());
+    }
+
+    [Fact]
+    public async Task TerminalUpdate_IsIdempotentAndCannotBeOverwrittenBySuccess()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
+        var claim = Assert.Single(await store.ClaimPendingAsync(
+            "terminal-owner",
+            1,
+            TimeSpan.FromSeconds(30),
+            5,
+            CancellationToken.None));
+        var failure = new ReleaseRiskExplanationTerminalFailure(
+            AiExplanationFailureClassifier.ResponseContractInvalidCode,
+            "AI explanation response violated the required response contract.");
+
+        Assert.True(await store.MarkTerminalAsync(
+            claim,
+            failure,
+            CancellationToken.None));
+        Assert.True(await store.MarkTerminalAsync(
+            claim,
+            failure,
+            CancellationToken.None));
+        Assert.False(await store.MarkTerminalAsync(
+            claim,
+            failure with { Reason = "A different terminal outcome." },
+            CancellationToken.None));
+        Assert.False(await store.MarkCompletedAsync(
+            claim,
+            CreateExplanation(envelope.EventId, "must not win"),
+            CancellationToken.None));
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Equal(failure.Code, state.FailureCode);
+        Assert.Equal(failure.Reason, state.FailureReason);
+        Assert.Null(state.CompletedAt);
+        Assert.Null(state.Explanation);
+    }
+
+    [Fact]
+    public async Task SuccessfulOutcome_CannotBeOverwrittenByStaleTerminalFailure()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
+        var claim = Assert.Single(await store.ClaimPendingAsync(
+            "success-owner",
+            1,
+            TimeSpan.FromSeconds(30),
+            5,
+            CancellationToken.None));
+
+        Assert.True(await store.MarkCompletedAsync(
+            claim,
+            CreateExplanation(envelope.EventId, "durable success"),
+            CancellationToken.None));
+        Assert.False(await store.MarkTerminalAsync(
+            claim,
+            new ReleaseRiskExplanationTerminalFailure(
+                AiExplanationFailureClassifier.UnexpectedErrorCode,
+                "A stale terminal update."),
+            CancellationToken.None));
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Equal("durable success", state.Explanation?.Summary);
+        Assert.NotNull(state.CompletedAt);
+        Assert.Null(state.FailedAt);
+        Assert.Empty(await store.ReadFailedWorkAsync(
+            10,
+            CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CrashAtAttemptLimit_TerminalizesExpiredWorkOnRestart()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var firstDataSource = NpgsqlDataSource.Create(connectionString);
+        await using var restartedDataSource = NpgsqlDataSource.Create(
+            connectionString);
+        var firstStore = new PostgreSqlReleaseRiskExplanationStore(
+            firstDataSource);
+        var restartedStore = new PostgreSqlReleaseRiskExplanationStore(
+            restartedDataSource);
+
+        var abandonedClaim = Assert.Single(await firstStore.ClaimPendingAsync(
+            "crashed-at-limit",
+            1,
+            TimeSpan.FromSeconds(30),
+            1,
+            CancellationToken.None));
+        await ExpireClaimAsync(connectionString, envelope.EventId);
+
+        Assert.Empty(await restartedStore.ClaimPendingAsync(
+            "restart-after-limit",
+            1,
+            TimeSpan.FromSeconds(30),
+            1,
+            CancellationToken.None));
+        Assert.Empty(await restartedStore.ClaimPendingAsync(
+            "second-restart-after-limit",
+            1,
+            TimeSpan.FromSeconds(30),
+            1,
+            CancellationToken.None));
+        Assert.False(await firstStore.MarkCompletedAsync(
+            abandonedClaim,
+            CreateExplanation(envelope.EventId, "stale crash result"),
+            CancellationToken.None));
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Equal(1, state.AttemptCount);
+        Assert.NotNull(state.FailedAt);
+        Assert.Equal(
+            AiExplanationFailureClassifier.AttemptLimitExhaustedCode,
+            state.FailureCode);
+        Assert.Null(state.CompletedAt);
+        Assert.Null(state.Explanation);
+    }
+
+    [Fact]
+    public async Task RetryableFailure_OnLastConfiguredAttempt_PersistsTerminalCause()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
+        using var processor = CreateProcessor(
+            store,
+            new ThrowingClient(new TimeoutException("Simulated timeout.")),
+            maximumAttempts: 1);
+
+        Assert.Equal(
+            1,
+            await processor.ProcessPendingBatchAsync(CancellationToken.None));
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Equal(1, state.AttemptCount);
+        Assert.NotNull(state.FailedAt);
+        Assert.Equal(
+            AiExplanationFailureClassifier.RequestTimeoutCode,
+            state.FailureCode);
+        Assert.Contains("maximum of 1 attempts", state.FailureReason);
+        Assert.Empty(await store.ClaimPendingAsync(
+            "restart-after-terminal-timeout",
+            1,
+            TimeSpan.FromSeconds(30),
+            1,
+            CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ExpiredOwner_CannotWriteTerminalFailureAfterReplacementSuccess()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var firstDataSource = NpgsqlDataSource.Create(connectionString);
+        await using var replacementDataSource = NpgsqlDataSource.Create(
+            connectionString);
+        var firstStore = new PostgreSqlReleaseRiskExplanationStore(
+            firstDataSource);
+        var replacementStore = new PostgreSqlReleaseRiskExplanationStore(
+            replacementDataSource);
+        var staleClaim = Assert.Single(await firstStore.ClaimPendingAsync(
+            "stale-owner",
+            1,
+            TimeSpan.FromSeconds(30),
+            5,
+            CancellationToken.None));
+        await ExpireClaimAsync(connectionString, envelope.EventId);
+        var replacementClaim = Assert.Single(
+            await replacementStore.ClaimPendingAsync(
+                "replacement-owner",
+                1,
+                TimeSpan.FromSeconds(30),
+                5,
+                CancellationToken.None));
+
+        Assert.True(await replacementStore.MarkCompletedAsync(
+            replacementClaim,
+            CreateExplanation(envelope.EventId, "replacement success"),
+            CancellationToken.None));
+        Assert.False(await firstStore.MarkTerminalAsync(
+            staleClaim,
+            new ReleaseRiskExplanationTerminalFailure(
+                AiExplanationFailureClassifier.UnexpectedErrorCode,
+                "Stale owner failure."),
+            CancellationToken.None));
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Equal("replacement success", state.Explanation?.Summary);
+        Assert.Null(state.FailedAt);
+        Assert.Equal(2, state.AttemptCount);
+    }
+
+    [Fact]
+    public async Task FailedWorkView_RejectsMutation()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
+        var claim = Assert.Single(await store.ClaimPendingAsync(
+            "failed-view-owner",
+            1,
+            TimeSpan.FromSeconds(30),
+            5,
+            CancellationToken.None));
+        Assert.True(await store.MarkTerminalAsync(
+            claim,
+            new ReleaseRiskExplanationTerminalFailure(
+                AiExplanationFailureClassifier.ResponseContractInvalidCode,
+                "Terminal contract failure."),
+            CancellationToken.None));
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            "UPDATE release_risk_ai_explanation_failed_work SET failure_reason = 'changed';",
+            connection);
+
+        var exception = await Assert.ThrowsAsync<PostgresException>(
+            () => command.ExecuteNonQueryAsync());
+        Assert.Equal(PostgresErrorCodes.ObjectNotInPrerequisiteState, exception.SqlState);
+    }
+
+    [Fact]
+    public async Task DatabaseConstraint_RejectsSuccessAndTerminalFailureTogether()
+    {
+        var connectionString = await CreateInitializedDatabaseAsync();
+        var envelope = await AcceptEnvelopeAsync(connectionString);
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            UPDATE release_risk_event_inbox
+            SET
+                explanation_completed_at = clock_timestamp(),
+                explanation = @explanation,
+                explanation_failed_at = clock_timestamp(),
+                explanation_failure_code = 'unexpected_error',
+                explanation_failure_reason = 'Mutually exclusive outcome.'
+            WHERE event_id = @event_id;
+            """,
+            connection);
+        command.Parameters.AddWithValue("event_id", envelope.EventId);
+        command.Parameters.AddWithValue(
+            "explanation",
+            NpgsqlDbType.Jsonb,
+            System.Text.Json.JsonSerializer.Serialize(
+                CreateExplanation(envelope.EventId, "invalid dual outcome"),
+                new System.Text.Json.JsonSerializerOptions(
+                    System.Text.Json.JsonSerializerDefaults.Web)));
+
+        var exception = await Assert.ThrowsAsync<PostgresException>(
+            () => command.ExecuteNonQueryAsync());
+        Assert.Equal(PostgresErrorCodes.CheckViolation, exception.SqlState);
+    }
+
+    [Fact]
+    public async Task VersionFourInbox_UpgradesThroughTerminalLifecycleAsPendingWork()
     {
         var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
         var envelope = CreateEnvelope();
@@ -245,18 +564,47 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         Assert.Null(state.CompletedAt);
         Assert.Null(state.Explanation);
         Assert.Equal(
-            new[] { 1, 2, 3, 4, 5 },
+            new[] { 1, 2, 3, 4, 5, 6 },
             await ReadMigrationVersionsAsync(connectionString));
 
         await using var dataSource = NpgsqlDataSource.Create(connectionString);
         var store = new PostgreSqlReleaseRiskExplanationStore(dataSource);
         var claim = Assert.Single(await store.ClaimPendingAsync(
-            "processor-after-v5-upgrade",
+            "processor-after-v6-upgrade",
             1,
             TimeSpan.FromSeconds(30),
+            5,
             CancellationToken.None));
         Assert.Equal(envelope.EventId, claim.EventId);
         Assert.Equal(1, claim.AttemptCount);
+    }
+
+    [Fact]
+    public async Task VersionFiveCompletedExplanation_UpgradesWithoutBecomingFailed()
+    {
+        var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
+        var envelope = CreateEnvelope();
+        await ApplyVersionFourSchemaAsync(connectionString, envelope);
+        await ApplyVersionFiveCompletionAsync(connectionString, envelope);
+
+        using (var application = new PostgreSqlTestApplicationFactory(
+                   connectionString,
+                   applyMigrationsOnStartup: true))
+        using (var client = application.CreateClient())
+        using (var response = await client.GetAsync("/health"))
+        {
+            response.EnsureSuccessStatusCode();
+        }
+
+        var state = await ReadStateAsync(connectionString, envelope.EventId);
+        Assert.Equal("completed before v6", state.Explanation?.Summary);
+        Assert.NotNull(state.CompletedAt);
+        Assert.Null(state.FailedAt);
+        Assert.Null(state.FailureCode);
+        Assert.Null(state.FailureReason);
+        Assert.Equal(
+            new[] { 1, 2, 3, 4, 5, 6 },
+            await ReadMigrationVersionsAsync(connectionString));
     }
 
     private async Task<string> CreateInitializedDatabaseAsync()
@@ -333,7 +681,8 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         IReleaseRiskExplanationStore store,
         IReleaseRiskExplanationClient client,
         int initialRetryDelayMilliseconds = 1_000,
-        int maximumRetryDelayMilliseconds = 60_000) =>
+        int maximumRetryDelayMilliseconds = 60_000,
+        int maximumAttempts = 5) =>
         new(
             store,
             client,
@@ -345,6 +694,7 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
                 LeaseDurationMilliseconds = 30_000,
                 InitialRetryDelayMilliseconds = initialRetryDelayMilliseconds,
                 MaximumRetryDelayMilliseconds = maximumRetryDelayMilliseconds,
+                MaximumAttempts = maximumAttempts,
                 StateUpdateTimeoutMilliseconds = 1_000
             }),
             NullLogger<ReleaseRiskExplanationProcessor>.Instance);
@@ -476,6 +826,62 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         return await reader.ReadToEndAsync();
     }
 
+    private static async Task ApplyVersionFiveCompletionAsync(
+        string connectionString,
+        ReleaseRiskOutboxEnvelope envelope)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        var migrationSql = await ReadMigrationResourceAsync(5);
+        await using (var migration = new NpgsqlCommand(
+                         migrationSql,
+                         connection,
+                         transaction))
+        {
+            await migration.ExecuteNonQueryAsync();
+        }
+
+        await using (var record = new NpgsqlCommand(
+                         """
+                         INSERT INTO release_guard_schema_migrations (
+                             version,
+                             description)
+                         VALUES (5, 'test schema version 5');
+                         """,
+                         connection,
+                         transaction))
+        {
+            await record.ExecuteNonQueryAsync();
+        }
+
+        await using (var complete = new NpgsqlCommand(
+                         """
+                         UPDATE release_risk_event_inbox
+                         SET
+                             explanation_completed_at = clock_timestamp(),
+                             explanation = @explanation
+                         WHERE event_id = @event_id;
+                         """,
+                         connection,
+                         transaction))
+        {
+            complete.Parameters.AddWithValue("event_id", envelope.EventId);
+            complete.Parameters.AddWithValue(
+                "explanation",
+                NpgsqlDbType.Jsonb,
+                System.Text.Json.JsonSerializer.Serialize(
+                    CreateExplanation(
+                        envelope.EventId,
+                        "completed before v6"),
+                    new System.Text.Json.JsonSerializerOptions(
+                        System.Text.Json.JsonSerializerDefaults.Web)));
+            Assert.Equal(1, await complete.ExecuteNonQueryAsync());
+        }
+
+        await transaction.CommitAsync();
+    }
+
     private static async Task<int[]> ReadMigrationVersionsAsync(
         string connectionString)
     {
@@ -513,7 +919,10 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
                 explanation_claim_expires_at,
                 explanation_completed_at,
                 explanation::text,
-                envelope::text
+                envelope::text,
+                explanation_failed_at,
+                explanation_failure_code,
+                explanation_failure_reason
             FROM release_risk_event_inbox
             WHERE event_id = @event_id;
             """,
@@ -540,7 +949,12 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
                     new System.Text.Json.JsonSerializerOptions(
                         System.Text.Json.JsonSerializerDefaults.Web)),
             envelopeJson,
-            ReleaseRiskOutboxEnvelope.Deserialize(envelopeJson));
+            ReleaseRiskOutboxEnvelope.Deserialize(envelopeJson),
+            reader.IsDBNull(7)
+                ? null
+                : reader.GetFieldValue<DateTimeOffset>(7),
+            reader.IsDBNull(8) ? null : reader.GetString(8),
+            reader.IsDBNull(9) ? null : reader.GetString(9));
     }
 
     private sealed record ExplanationState(
@@ -551,7 +965,10 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         DateTimeOffset? CompletedAt,
         ReleaseRiskExplanation? Explanation,
         string EnvelopeJson,
-        ReleaseRiskOutboxEnvelope Envelope);
+        ReleaseRiskOutboxEnvelope Envelope,
+        DateTimeOffset? FailedAt,
+        string? FailureCode,
+        string? FailureReason);
 
     private sealed class RecordingClient : IReleaseRiskExplanationClient
     {

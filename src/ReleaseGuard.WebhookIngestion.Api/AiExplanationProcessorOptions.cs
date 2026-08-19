@@ -13,6 +13,7 @@ public sealed class AiExplanationProcessorOptions
     public const int MinimumStateUpdateTimeoutMilliseconds = 100;
     public const int MaximumStateUpdateTimeoutMilliseconds = 30_000;
     public const int MaximumRetryDelayMillisecondsLimit = 3_600_000;
+    public const int MaximumAllowedAttempts = 100;
 
     public bool Enabled { get; init; }
 
@@ -25,6 +26,8 @@ public sealed class AiExplanationProcessorOptions
     public int InitialRetryDelayMilliseconds { get; init; } = 1_000;
 
     public int MaximumRetryDelayMilliseconds { get; init; } = 60_000;
+
+    public int MaximumAttempts { get; init; } = 5;
 
     public int StateUpdateTimeoutMilliseconds { get; init; } = 5_000;
 
@@ -43,6 +46,7 @@ public sealed class AiExplanationProcessorOptions
                options.MaximumRetryDelayMilliseconds is
                    >= MinimumPollIntervalMilliseconds and <= MaximumRetryDelayMillisecondsLimit &&
                options.InitialRetryDelayMilliseconds <= options.MaximumRetryDelayMilliseconds &&
+               options.MaximumAttempts is >= 1 and <= MaximumAllowedAttempts &&
                options.StateUpdateTimeoutMilliseconds < options.LeaseDurationMilliseconds;
     }
 
@@ -94,7 +98,7 @@ public sealed class AiExplanationProcessorOptionsValidator :
         if (!AiExplanationProcessorOptions.IsValid(options))
         {
             return ValidateOptionsResult.Fail(
-                $"{AiExplanationProcessorOptions.SectionName} settings must define a bounded batch, poll interval, lease, state-update timeout and exponential retry range; state-update timeout must be shorter than the lease.");
+                $"{AiExplanationProcessorOptions.SectionName} settings must define a bounded batch, poll interval, lease, state-update timeout, maximum attempt count and exponential retry range; state-update timeout must be shorter than the lease.");
         }
 
         var minimumLeaseMilliseconds =
