@@ -9,32 +9,17 @@ namespace ReleaseGuard.WebhookIngestion.Api.Tests;
 
 public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFactory>
 {
-    private static readonly byte[] Payload = Encoding.UTF8.GetBytes(
-        """
-        {
-          "action": "opened",
-          "number": 42,
-          "repository": {
-            "full_name": "acme/ReleaseGuard"
-          },
-          "pull_request": {
-            "title": "Protect production releases",
-            "user": {
-              "login": "octocat"
-            },
-            "base": {
-              "ref": "main"
-            },
-            "head": {
-              "ref": "feature/release-guard"
-            },
-            "draft": false,
-            "changed_files": 4,
-            "additions": 120,
-            "deletions": 15
-          }
-        }
-        """);
+    private static readonly byte[] OpenedPayload = CreatePullRequestPayload(
+        GitHubRiskInputMapper.OpenedAction,
+        changedFiles: 4,
+        additions: 120,
+        deletions: 15);
+
+    private static readonly byte[] SynchronizePayload = CreatePullRequestPayload(
+        GitHubRiskInputMapper.SynchronizeAction,
+        changedFiles: 20,
+        additions: 1_000,
+        deletions: 5);
 
     private readonly HttpClient _client;
 
@@ -48,8 +33,8 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     {
         var deliveryId = Guid.NewGuid();
         using var request = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
             deliveryId: deliveryId.ToString());
 
         using var response = await _client.SendAsync(request);
@@ -83,10 +68,74 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     }
 
     [Fact]
+    public async Task PostWebhook_WithValidSynchronize_ReturnsAcceptedUpdatedSnapshotAndRisk()
+    {
+        var deliveryId = Guid.NewGuid();
+        using var request = CreateRequest(
+            SynchronizePayload,
+            CreateSignature(SynchronizePayload),
+            deliveryId: deliveryId.ToString());
+
+        using var response = await _client.SendAsync(request);
+        var receipt = await response.Content.ReadFromJsonAsync<GitHubWebhookReceipt>();
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.NotNull(receipt);
+        Assert.Equal(deliveryId, receipt.DeliveryId);
+        Assert.Equal("accepted", receipt.Status);
+        Assert.NotNull(receipt.RiskInput);
+        Assert.Equal(deliveryId, receipt.RiskInput.SourceDeliveryId);
+        Assert.Equal(GitHubRiskInputMapper.ChangeUpdatedKind, receipt.RiskInput.Kind);
+        Assert.Equal(20, receipt.RiskInput.ChangedFiles);
+        Assert.Equal(1_000, receipt.RiskInput.Additions);
+        Assert.Equal(5, receipt.RiskInput.Deletions);
+        Assert.NotNull(receipt.RiskAssessment);
+        Assert.Equal(ReleaseRiskPolicy.MaximumScore, receipt.RiskAssessment.Score);
+        Assert.Equal(ReleaseRiskPolicy.HighLevel, receipt.RiskAssessment.Level);
+        Assert.Collection(
+            receipt.RiskAssessment.Factors,
+            factor => Assert.Equal("broad_change", factor.Code),
+            factor => Assert.Equal("high_change_churn", factor.Code),
+            factor => Assert.Equal("primary_target_branch", factor.Code));
+    }
+
+    [Fact]
+    public async Task PostWebhook_WithDistinctSynchronizeDeliveries_EvaluatesEachSnapshotIndependently()
+    {
+        var lowRiskPayload = CreatePullRequestPayload(
+            GitHubRiskInputMapper.SynchronizeAction,
+            changedFiles: 1,
+            additions: 10,
+            deletions: 5);
+        using var lowRiskRequest = CreateRequest(
+            lowRiskPayload,
+            CreateSignature(lowRiskPayload));
+        using var highRiskRequest = CreateRequest(
+            SynchronizePayload,
+            CreateSignature(SynchronizePayload));
+
+        using var lowRiskResponse = await _client.SendAsync(lowRiskRequest);
+        using var highRiskResponse = await _client.SendAsync(highRiskRequest);
+        var lowRiskReceipt =
+            await lowRiskResponse.Content.ReadFromJsonAsync<GitHubWebhookReceipt>();
+        var highRiskReceipt =
+            await highRiskResponse.Content.ReadFromJsonAsync<GitHubWebhookReceipt>();
+
+        Assert.Equal(HttpStatusCode.Accepted, lowRiskResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, highRiskResponse.StatusCode);
+        Assert.NotNull(lowRiskReceipt);
+        Assert.NotNull(highRiskReceipt);
+        Assert.Equal(GitHubRiskInputMapper.ChangeUpdatedKind, lowRiskReceipt.RiskInput?.Kind);
+        Assert.Equal(GitHubRiskInputMapper.ChangeUpdatedKind, highRiskReceipt.RiskInput?.Kind);
+        Assert.Equal(20, lowRiskReceipt.RiskAssessment?.Score);
+        Assert.Equal(ReleaseRiskPolicy.MaximumScore, highRiskReceipt.RiskAssessment?.Score);
+    }
+
+    [Fact]
     public async Task PostWebhook_WithInvalidSignature_ReturnsUnauthorized()
     {
         using var request = CreateRequest(
-            Payload,
+            OpenedPayload,
             $"sha256={new string('0', 64)}");
 
         using var response = await _client.SendAsync(request);
@@ -97,7 +146,7 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     [Fact]
     public async Task PostWebhook_WithoutSignature_ReturnsUnauthorized()
     {
-        using var request = CreateRequest(Payload, signature: null);
+        using var request = CreateRequest(OpenedPayload, signature: null);
 
         using var response = await _client.SendAsync(request);
 
@@ -109,7 +158,7 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     [InlineData("sha256=not-a-hex-digest")]
     public async Task PostWebhook_WithMalformedSignature_ReturnsBadRequest(string signature)
     {
-        using var request = CreateRequest(Payload, signature);
+        using var request = CreateRequest(OpenedPayload, signature);
 
         using var response = await _client.SendAsync(request);
 
@@ -121,12 +170,39 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     {
         var deliveryId = Guid.NewGuid();
         using var firstRequest = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
             deliveryId: deliveryId.ToString());
         using var repeatedRequest = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
+            deliveryId: deliveryId.ToString());
+
+        using var firstResponse = await _client.SendAsync(firstRequest);
+        using var repeatedResponse = await _client.SendAsync(repeatedRequest);
+        var repeatedReceipt =
+            await repeatedResponse.Content.ReadFromJsonAsync<GitHubWebhookReceipt>();
+
+        Assert.Equal(HttpStatusCode.Accepted, firstResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, repeatedResponse.StatusCode);
+        Assert.NotNull(repeatedReceipt);
+        Assert.Equal(deliveryId, repeatedReceipt.DeliveryId);
+        Assert.Equal("duplicate", repeatedReceipt.Status);
+        Assert.Null(repeatedReceipt.RiskInput);
+        Assert.Null(repeatedReceipt.RiskAssessment);
+    }
+
+    [Fact]
+    public async Task PostWebhook_WhenSynchronizeDeliveryIsRepeated_ReturnsDuplicate()
+    {
+        var deliveryId = Guid.NewGuid();
+        using var firstRequest = CreateRequest(
+            SynchronizePayload,
+            CreateSignature(SynchronizePayload),
+            deliveryId: deliveryId.ToString());
+        using var repeatedRequest = CreateRequest(
+            SynchronizePayload,
+            CreateSignature(SynchronizePayload),
             deliveryId: deliveryId.ToString());
 
         using var firstResponse = await _client.SendAsync(firstRequest);
@@ -210,8 +286,30 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
             CreateSignature(incompletePayload),
             deliveryId: deliveryId.ToString());
         using var validRequest = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
+            deliveryId: deliveryId.ToString());
+
+        using var incompleteResponse = await _client.SendAsync(incompleteRequest);
+        using var validResponse = await _client.SendAsync(validRequest);
+
+        Assert.Equal(HttpStatusCode.BadRequest, incompleteResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, validResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task PostWebhook_WithInvalidSynchronize_DoesNotReserveDeliveryId()
+    {
+        var deliveryId = Guid.NewGuid();
+        var incompletePayload = Encoding.UTF8.GetBytes(
+            """{"action":"synchronize","number":42}""");
+        using var incompleteRequest = CreateRequest(
+            incompletePayload,
+            CreateSignature(incompletePayload),
+            deliveryId: deliveryId.ToString());
+        using var validRequest = CreateRequest(
+            SynchronizePayload,
+            CreateSignature(SynchronizePayload),
             deliveryId: deliveryId.ToString());
 
         using var incompleteResponse = await _client.SendAsync(incompleteRequest);
@@ -229,8 +327,8 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
         bool includeEventHeader)
     {
         using var request = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
             includeDeliveryHeader: includeDeliveryHeader,
             includeEventHeader: includeEventHeader);
 
@@ -243,8 +341,8 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
     public async Task PostWebhook_WithNonGuidDeliveryId_ReturnsBadRequest()
     {
         using var request = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
             deliveryId: "not-a-guid");
 
         using var response = await _client.SendAsync(request);
@@ -262,8 +360,8 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
             CreateSignature(malformedPayload),
             deliveryId: deliveryId.ToString());
         using var validRequest = CreateRequest(
-            Payload,
-            CreateSignature(Payload),
+            OpenedPayload,
+            CreateSignature(OpenedPayload),
             deliveryId: deliveryId.ToString());
 
         using var malformedResponse = await _client.SendAsync(malformedRequest);
@@ -285,6 +383,38 @@ public sealed class GitHubWebhookEndpointTests : IClassFixture<TestApplicationFa
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
+
+    private static byte[] CreatePullRequestPayload(
+        string action,
+        int changedFiles,
+        int additions,
+        int deletions) =>
+        Encoding.UTF8.GetBytes(
+            $$"""
+            {
+              "action": "{{action}}",
+              "number": 42,
+              "repository": {
+                "full_name": "acme/ReleaseGuard"
+              },
+              "pull_request": {
+                "title": "Protect production releases",
+                "user": {
+                  "login": "octocat"
+                },
+                "base": {
+                  "ref": "main"
+                },
+                "head": {
+                  "ref": "feature/release-guard"
+                },
+                "draft": false,
+                "changed_files": {{changedFiles}},
+                "additions": {{additions}},
+                "deletions": {{deletions}}
+              }
+            }
+            """);
 
     private static HttpRequestMessage CreateRequest(
         byte[] requestBody,

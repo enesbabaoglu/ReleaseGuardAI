@@ -22,7 +22,17 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
             {
                 [$"{GitHubWebhookOptions.SectionName}:Secret"] = GitHubWebhookSecret,
                 [$"{PostgreSqlOptions.SectionName}:ConnectionString"] =
-                    "Host=unit-test;Database=releaseguard"
+                    "Host=unit-test;Database=releaseguard",
+                [$"{KafkaProducerOptions.SectionName}:BootstrapServers"] =
+                    "localhost:19092",
+                [$"{KafkaProducerOptions.SectionName}:Topic"] =
+                    "releaseguard.release-risk-assessed-tests",
+                [$"{KafkaConsumerOptions.SectionName}:BootstrapServers"] =
+                    "localhost:19092",
+                [$"{KafkaConsumerOptions.SectionName}:Topic"] =
+                    "releaseguard.release-risk-assessed-tests",
+                [$"{KafkaConsumerOptions.SectionName}:GroupId"] =
+                    "releaseguard-webhook-unit-tests"
             });
         });
 

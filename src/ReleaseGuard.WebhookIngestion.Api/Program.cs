@@ -23,9 +23,77 @@ builder.Services
         $"{PostgreSqlOptions.SectionName}:ConnectionString must be a valid PostgreSQL connection string with Host and Database.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<KafkaProducerOptions>()
+    .BindConfiguration(KafkaProducerOptions.SectionName)
+    .Validate(
+        KafkaProducerOptions.HasValidBootstrapServers,
+        $"{KafkaProducerOptions.SectionName}:BootstrapServers must contain one or more host:port endpoints.")
+    .Validate(
+        KafkaProducerOptions.HasValidTopic,
+        $"{KafkaProducerOptions.SectionName}:Topic must be a valid explicit Kafka topic name of at most 249 UTF-8 bytes.")
+    .Validate(
+        KafkaProducerOptions.HasValidClientId,
+        $"{KafkaProducerOptions.SectionName}:ClientId must contain between 1 and 128 characters.")
+    .Validate(
+        KafkaProducerOptions.HasValidTimeouts,
+        $"{KafkaProducerOptions.SectionName} timeouts must be between {KafkaProducerOptions.MinimumTimeoutMilliseconds} and {KafkaProducerOptions.MaximumTimeoutMilliseconds} milliseconds, and RequestTimeoutMilliseconds must not exceed DeliveryTimeoutMilliseconds.")
+    .Validate(
+        KafkaProducerOptions.HasValidRetryLimit,
+        $"{KafkaProducerOptions.SectionName}:MaximumRetries must be between {KafkaProducerOptions.MinimumRetries} and {KafkaProducerOptions.MaximumAllowedRetries}.")
+    .ValidateOnStart();
+
+builder.Services
+    .AddOptions<KafkaConsumerOptions>()
+    .BindConfiguration(KafkaConsumerOptions.SectionName)
+    .Validate(
+        KafkaConsumerOptions.HasValidBootstrapServers,
+        $"{KafkaConsumerOptions.SectionName}:BootstrapServers must contain one or more host:port endpoints.")
+    .Validate(
+        KafkaConsumerOptions.HasValidTopic,
+        $"{KafkaConsumerOptions.SectionName}:Topic must be a valid explicit Kafka topic name of at most 249 UTF-8 bytes.")
+    .Validate(
+        KafkaConsumerOptions.HasValidGroupId,
+        $"{KafkaConsumerOptions.SectionName}:GroupId must be a printable value of at most {KafkaConsumerOptions.MaximumGroupIdUtf8Bytes} UTF-8 bytes.")
+    .Validate(
+        KafkaConsumerOptions.HasValidClientId,
+        $"{KafkaConsumerOptions.SectionName}:ClientId must be a printable value of at most 128 UTF-8 bytes.")
+    .Validate(
+        KafkaConsumerOptions.HasValidConsumeTimeout,
+        $"{KafkaConsumerOptions.SectionName}:ConsumeTimeoutMilliseconds must be between {KafkaConsumerOptions.MinimumConsumeTimeoutMilliseconds} and {KafkaConsumerOptions.MaximumConsumeTimeoutMilliseconds}.")
+    .Validate(
+        KafkaConsumerOptions.HasValidBrokerRequestTimeout,
+        $"{KafkaConsumerOptions.SectionName}:BrokerRequestTimeoutMilliseconds must be between {KafkaConsumerOptions.MinimumBrokerRequestTimeoutMilliseconds} and {KafkaConsumerOptions.MaximumBrokerRequestTimeoutMilliseconds}.")
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<KafkaConsumerOptions>,
+    KafkaConsumerOptionsValidator>();
+
+builder.Services
+    .AddOptions<OutboxDispatcherOptions>()
+    .BindConfiguration(OutboxDispatcherOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<OutboxDispatcherOptions>,
+    OutboxDispatcherOptionsValidator>();
+
+builder.Services
+    .AddOptions<ReleaseRiskInboxProcessorOptions>()
+    .BindConfiguration(ReleaseRiskInboxProcessorOptions.SectionName)
+    .Validate(
+        ReleaseRiskInboxProcessorOptions.IsValid,
+        $"{ReleaseRiskInboxProcessorOptions.SectionName}:PersistenceTimeoutMilliseconds must be between {ReleaseRiskInboxProcessorOptions.MinimumPersistenceTimeoutMilliseconds} and {ReleaseRiskInboxProcessorOptions.MaximumPersistenceTimeoutMilliseconds}.")
+    .ValidateOnStart();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
+builder.Services.AddSingleton<
+    IReleaseRiskEventProducer,
+    KafkaReleaseRiskEventProducer>();
+builder.Services.AddSingleton<
+    IReleaseRiskEventConsumer,
+    KafkaReleaseRiskEventConsumer>();
 builder.Services.AddSingleton<NpgsqlDataSource>(serviceProvider =>
 {
     var options = serviceProvider
@@ -39,7 +107,24 @@ builder.Services.AddSingleton<NpgsqlDataSource>(serviceProvider =>
 builder.Services.AddSingleton<
     IGitHubWebhookDeliveryStore,
     PostgreSqlGitHubWebhookDeliveryStore>();
+builder.Services.AddSingleton<
+    IReleaseRiskOutboxStore,
+    PostgreSqlReleaseRiskOutboxStore>();
+builder.Services.AddSingleton<
+    IReleaseRiskInboxStore,
+    PostgreSqlReleaseRiskInboxStore>();
 builder.Services.AddHostedService<PostgreSqlSchemaInitializer>();
+builder.Services.AddHostedService<ReleaseRiskOutboxDispatcher>();
+builder.Services.AddSingleton<ReleaseRiskInboxProcessor>(serviceProvider =>
+    new ReleaseRiskInboxProcessor(
+        () => serviceProvider.GetRequiredService<IReleaseRiskEventConsumer>(),
+        serviceProvider.GetRequiredService<IReleaseRiskInboxStore>(),
+        serviceProvider.GetRequiredService<
+            IOptions<ReleaseRiskInboxProcessorOptions>>(),
+        serviceProvider.GetRequiredService<
+            ILogger<ReleaseRiskInboxProcessor>>()));
+builder.Services.AddHostedService(serviceProvider =>
+    serviceProvider.GetRequiredService<ReleaseRiskInboxProcessor>());
 
 var app = builder.Build();
 

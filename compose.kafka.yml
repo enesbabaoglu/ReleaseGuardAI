@@ -1,0 +1,28 @@
+name: releaseguard-kafka
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=external://0.0.0.0:19092
+      - --advertise-kafka-addr=external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test:
+        - CMD
+        - rpk
+        - cluster
+        - health
+        - -X
+        - brokers=localhost:19092
+      interval: 2s
+      timeout: 2s
+      retries: 30

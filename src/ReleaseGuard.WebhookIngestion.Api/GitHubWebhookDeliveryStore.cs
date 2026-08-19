@@ -30,7 +30,7 @@ public sealed class PostgreSqlGitHubWebhookDeliveryStore : IGitHubWebhookDeliver
             @disposition,
             @risk_input,
             @risk_assessment)
-        ON CONFLICT (delivery_id) DO NOTHING
+        ON CONFLICT DO NOTHING
         RETURNING delivery_id;
         """;
 

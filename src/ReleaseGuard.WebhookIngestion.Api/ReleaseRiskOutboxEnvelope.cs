@@ -43,4 +43,39 @@ public sealed record ReleaseRiskOutboxEnvelope(
     }
 
     public string Serialize() => JsonSerializer.Serialize(this, JsonOptions);
+
+    public byte[] SerializeToUtf8Bytes() =>
+        JsonSerializer.SerializeToUtf8Bytes(this, JsonOptions);
+
+    public bool IsValidVersionOneContract() =>
+        string.Equals(
+            EventType,
+            CurrentEventType,
+            StringComparison.Ordinal) &&
+        SchemaVersion == CurrentSchemaVersion &&
+        RiskInput is not null &&
+        RiskAssessment is not null &&
+        EventId == RiskInput.SourceDeliveryId &&
+        string.Equals(
+            SourceProvider,
+            RiskInput.SourceProvider,
+            StringComparison.Ordinal) &&
+        string.Equals(
+            Kind,
+            RiskInput.Kind,
+            StringComparison.Ordinal);
+
+    public static ReleaseRiskOutboxEnvelope Deserialize(string json)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(json);
+        return JsonSerializer.Deserialize<ReleaseRiskOutboxEnvelope>(json, JsonOptions)
+            ?? throw new JsonException(
+                "The release risk outbox envelope deserialized to null.");
+    }
+
+    public static ReleaseRiskOutboxEnvelope Deserialize(
+        ReadOnlySpan<byte> utf8Json) =>
+        JsonSerializer.Deserialize<ReleaseRiskOutboxEnvelope>(utf8Json, JsonOptions)
+        ?? throw new JsonException(
+            "The release risk outbox envelope deserialized to null.");
 }

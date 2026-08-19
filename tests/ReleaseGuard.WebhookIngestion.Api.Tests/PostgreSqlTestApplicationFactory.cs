@@ -29,7 +29,17 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                 [$"{PostgreSqlOptions.SectionName}:ConnectionString"] =
                     _connectionString,
                 [$"{PostgreSqlOptions.SectionName}:ApplyMigrationsOnStartup"] =
-                    _applyMigrationsOnStartup.ToString()
+                    _applyMigrationsOnStartup.ToString(),
+                [$"{KafkaProducerOptions.SectionName}:BootstrapServers"] =
+                    "localhost:19092",
+                [$"{KafkaProducerOptions.SectionName}:Topic"] =
+                    "releaseguard.release-risk-assessed-tests",
+                [$"{KafkaConsumerOptions.SectionName}:BootstrapServers"] =
+                    "localhost:19092",
+                [$"{KafkaConsumerOptions.SectionName}:Topic"] =
+                    "releaseguard.release-risk-assessed-tests",
+                [$"{KafkaConsumerOptions.SectionName}:GroupId"] =
+                    "releaseguard-postgresql-tests"
             });
         });
     }

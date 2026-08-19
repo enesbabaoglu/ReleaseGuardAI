@@ -6,7 +6,7 @@ namespace ReleaseGuard.WebhookIngestion.Api;
 
 public sealed class PostgreSqlSchemaInitializer : IHostedService
 {
-    private const int LatestSchemaVersion = 2;
+    private const int LatestSchemaVersion = 4;
     private const long MigrationLockKey = 7_142_033_117_501_001;
 
     private static readonly Migration[] Migrations =
@@ -18,7 +18,15 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         new(
             2,
             "create release risk outbox",
-            "ReleaseGuard.Database.Migrations.V002.sql")
+            "ReleaseGuard.Database.Migrations.V002.sql"),
+        new(
+            3,
+            "add release risk outbox dispatch lifecycle",
+            "ReleaseGuard.Database.Migrations.V003.sql"),
+        new(
+            4,
+            "create release risk event inbox",
+            "ReleaseGuard.Database.Migrations.V004.sql")
     ];
 
     private const string CreateMigrationTableSql = """
@@ -39,8 +47,25 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         FROM github_webhook_deliveries
         LIMIT 0;
 
-        SELECT 1
+        SELECT
+            published_at,
+            attempt_count,
+            next_attempt_at,
+            claimed_by,
+            claim_expires_at
         FROM release_risk_outbox_messages
+        LIMIT 0;
+
+        SELECT
+            event_id,
+            message_key,
+            topic,
+            kafka_partition,
+            kafka_offset,
+            payload,
+            envelope,
+            accepted_at
+        FROM release_risk_event_inbox
         LIMIT 0;
         """;
 

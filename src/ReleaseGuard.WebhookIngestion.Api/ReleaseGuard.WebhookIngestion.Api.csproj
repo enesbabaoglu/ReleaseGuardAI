@@ -3,6 +3,7 @@
     <TargetFramework>net8.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Confluent.Kafka" Version="2.15.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
   <ItemGroup>
@@ -10,5 +11,9 @@
                       LogicalName="ReleaseGuard.Database.Migrations.V001.sql" />
     <EmbeddedResource Include="Database/Migrations/V002__create_release_risk_outbox.sql"
                       LogicalName="ReleaseGuard.Database.Migrations.V002.sql" />
+    <EmbeddedResource Include="Database/Migrations/V003__add_release_risk_outbox_dispatch_lifecycle.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V003.sql" />
+    <EmbeddedResource Include="Database/Migrations/V004__create_release_risk_event_inbox.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V004.sql" />
   </ItemGroup>
 </Project>

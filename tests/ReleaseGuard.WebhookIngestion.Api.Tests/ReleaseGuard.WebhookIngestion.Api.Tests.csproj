@@ -23,5 +23,10 @@
   <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
-</Project>
 
+  <ItemGroup>
+    <None Include="../../contracts/release-risk-assessed.v1.example.json"
+          Link="contracts/release-risk-assessed.v1.example.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
