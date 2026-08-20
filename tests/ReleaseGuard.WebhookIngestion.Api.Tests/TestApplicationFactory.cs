@@ -47,6 +47,9 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
 
     public TestExplanationQuery ExplanationQuery { get; } = new();
 
+    internal TestAiExplanationQueryMetrics ExplanationQueryMetrics { get; } =
+        new();
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.ConfigureAppConfiguration(configuration =>
@@ -90,6 +93,9 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
             services.AddSingleton<IGitHubWebhookDeliveryStore, TestDeliveryStore>();
             services.RemoveAll<IReleaseRiskExplanationQuery>();
             services.AddSingleton<IReleaseRiskExplanationQuery>(ExplanationQuery);
+            services.RemoveAll<IAiExplanationQueryMetrics>();
+            services.AddSingleton<IAiExplanationQueryMetrics>(
+                ExplanationQueryMetrics);
             if (_rateLimitTimeProvider is not null)
             {
                 services.RemoveAll<TimeProvider>();

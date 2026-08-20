@@ -304,6 +304,14 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
         Assert.Equal(
             HttpStatusCode.Unauthorized,
             unauthorizedAfterExhaustion.StatusCode);
+        Assert.Equal(2, application.ExplanationQueryMetrics.AuthenticationFailures);
+        Assert.Equal(1, application.ExplanationQueryMetrics.RateLimitPermits);
+        Assert.Equal(3, application.ExplanationQueryMetrics.RateLimitRejections);
+        Assert.Equal(
+            [AiExplanationQueryOutcome.Pending],
+            application.ExplanationQueryMetrics.Outcomes);
+        Assert.Single(
+            application.ExplanationQueryMetrics.DatabaseReadDurations);
     }
 
     [Fact]
@@ -341,6 +349,100 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
             Route(eventId),
             TestApplicationFactory.AiExplanationQueryCredential);
         Assert.Equal(HttpStatusCode.OK, afterReset.StatusCode);
+        Assert.Equal(2, application.ExplanationQueryMetrics.RateLimitPermits);
+        Assert.Equal(1, application.ExplanationQueryMetrics.RateLimitRejections);
+        Assert.Equal(
+            [
+                AiExplanationQueryOutcome.Pending,
+                AiExplanationQueryOutcome.Pending
+            ],
+            application.ExplanationQueryMetrics.Outcomes);
+        Assert.Equal(
+            2,
+            application.ExplanationQueryMetrics.DatabaseReadDurations.Count);
+    }
+
+    [Fact]
+    public async Task Get_RecordsOnlyBoundedOutcomesAndDatabaseReadDurations()
+    {
+        using var application = new TestApplicationFactory(
+            TestApplicationFactory.AiExplanationQueryCredential);
+        var pendingEventId = Guid.NewGuid();
+        var completedEventId = Guid.NewGuid();
+        var failedEventId = Guid.NewGuid();
+        var timeoutEventId = Guid.NewGuid();
+        application.ExplanationQuery.SetSnapshot(
+            pendingEventId,
+            new PendingReleaseRiskExplanationQuerySnapshot(pendingEventId));
+        application.ExplanationQuery.SetSnapshot(
+            completedEventId,
+            new CompletedReleaseRiskExplanationQuerySnapshot(
+                completedEventId,
+                CreateExplanation(completedEventId, "measured completion")));
+        application.ExplanationQuery.SetSnapshot(
+            failedEventId,
+            new FailedReleaseRiskExplanationQuerySnapshot(
+                failedEventId,
+                new ReleaseRiskExplanationTerminalFailure(
+                    "response_contract_invalid",
+                    "AI explanation response violated the required response contract.")));
+        application.ExplanationQuery.SetHandler(
+            timeoutEventId,
+            async cancellationToken =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                return null;
+            });
+        using var client = application.CreateClient();
+
+        using (var malformed = await SendAsync(
+                   client,
+                   Route("not-a-guid"),
+                   TestApplicationFactory.AiExplanationQueryCredential))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
+        }
+
+        foreach (var eventId in new[]
+                 {
+                     pendingEventId,
+                     completedEventId,
+                     failedEventId,
+                     Guid.NewGuid(),
+                     timeoutEventId
+                 })
+        {
+            using var response = await SendAsync(
+                client,
+                Route(eventId),
+                TestApplicationFactory.AiExplanationQueryCredential);
+            Assert.Contains(
+                response.StatusCode,
+                new[]
+                {
+                    HttpStatusCode.OK,
+                    HttpStatusCode.NotFound,
+                    HttpStatusCode.ServiceUnavailable
+                });
+        }
+
+        Assert.Equal(6, application.ExplanationQueryMetrics.RateLimitPermits);
+        Assert.Equal(0, application.ExplanationQueryMetrics.RateLimitRejections);
+        Assert.Equal(
+            [
+                AiExplanationQueryOutcome.Pending,
+                AiExplanationQueryOutcome.Completed,
+                AiExplanationQueryOutcome.Failed,
+                AiExplanationQueryOutcome.NotFound,
+                AiExplanationQueryOutcome.Timeout
+            ],
+            application.ExplanationQueryMetrics.Outcomes);
+        Assert.Equal(
+            5,
+            application.ExplanationQueryMetrics.DatabaseReadDurations.Count);
+        Assert.All(
+            application.ExplanationQueryMetrics.DatabaseReadDurations,
+            duration => Assert.True(duration >= TimeSpan.Zero));
     }
 
     [Fact]
@@ -393,18 +495,54 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
             $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}";
         using var authenticator = CreateAuthenticator();
         var rateLimitBoundary = CreateRateLimitBoundary();
+        var metrics = new TestAiExplanationQueryMetrics();
 
         var handling = ReleaseRiskExplanationQueryEndpoint.HandleAsync(
             context.Request,
             eventId.ToString("D"),
             authenticator,
             rateLimitBoundary,
+            metrics,
             query,
             Options.Create(new AiExplanationQueryOptions()),
             cancellation.Token);
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => handling);
+        Assert.Equal(1, metrics.RateLimitPermits);
+        Assert.Empty(metrics.Outcomes);
+        Assert.Single(metrics.DatabaseReadDurations);
+    }
+
+    [Fact]
+    public async Task HandleAsync_WhenQueryThrows_RecordsDurationWithoutInventingOutcome()
+    {
+        var eventId = Guid.NewGuid();
+        var query = new TestApplicationFactory.TestExplanationQuery();
+        query.SetHandler(
+            eventId,
+            _ => throw new InvalidOperationException("unexpected query failure"));
+        var context = new DefaultHttpContext();
+        context.Request.Headers.Authorization =
+            $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}";
+        using var authenticator = CreateAuthenticator();
+        var rateLimitBoundary = CreateRateLimitBoundary();
+        var metrics = new TestAiExplanationQueryMetrics();
+
+        var handling = ReleaseRiskExplanationQueryEndpoint.HandleAsync(
+            context.Request,
+            eventId.ToString("D"),
+            authenticator,
+            rateLimitBoundary,
+            metrics,
+            query,
+            Options.Create(new AiExplanationQueryOptions()),
+            CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => handling);
+        Assert.Equal(1, metrics.RateLimitPermits);
+        Assert.Empty(metrics.Outcomes);
+        Assert.Single(metrics.DatabaseReadDurations);
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
@@ -21,6 +22,7 @@ public static class ReleaseRiskExplanationQueryEndpoint
         string eventId,
         AiExplanationQueryAuthenticator authenticator,
         AiExplanationQueryRateLimitBoundary rateLimitBoundary,
+        IAiExplanationQueryMetrics metrics,
         IReleaseRiskExplanationQuery query,
         IOptions<AiExplanationQueryOptions> options,
         CancellationToken cancellationToken)
@@ -28,6 +30,7 @@ public static class ReleaseRiskExplanationQueryEndpoint
         if (!authenticator.IsAuthorized(
                 request.Headers[AiExplanationQueryAuthenticator.HeaderName]))
         {
+            metrics.RecordAuthenticationFailure();
             request.HttpContext.Response.Headers.WWWAuthenticate =
                 AiExplanationQueryAuthenticator.Challenge;
             return Problem(
@@ -40,6 +43,7 @@ public static class ReleaseRiskExplanationQueryEndpoint
         var rateLimitDecision = rateLimitBoundary.AttemptAcquire();
         if (!rateLimitDecision.IsAcquired)
         {
+            metrics.RecordRateLimitRejection();
             request.HttpContext.Response.Headers.RetryAfter =
                 rateLimitDecision.RetryAfterSeconds
                     .ToString(CultureInfo.InvariantCulture);
@@ -49,6 +53,8 @@ public static class ReleaseRiskExplanationQueryEndpoint
                 "AI explanation request rate limit exceeded.",
                 "The request rate limit was exceeded. Retry after the indicated delay.");
         }
+
+        metrics.RecordRateLimitPermit();
 
         if (!Guid.TryParseExact(eventId, "D", out var parsedEventId))
         {
@@ -66,6 +72,7 @@ public static class ReleaseRiskExplanationQueryEndpoint
             TimeSpan.FromMilliseconds(options.Value.ReadTimeoutMilliseconds));
 
         ReleaseRiskExplanationQuerySnapshot? snapshot;
+        var databaseReadStarted = Stopwatch.GetTimestamp();
         try
         {
             snapshot = await query.ReadAsync(
@@ -76,15 +83,22 @@ public static class ReleaseRiskExplanationQueryEndpoint
             when (!cancellationToken.IsCancellationRequested &&
                   timeoutSource.IsCancellationRequested)
         {
+            metrics.RecordOutcome(AiExplanationQueryOutcome.Timeout);
             return Problem(
                 StatusCodes.Status503ServiceUnavailable,
                 QueryTimeoutCode,
                 "AI explanation query timed out.",
                 "The AI explanation state could not be read within the configured database deadline.");
         }
+        finally
+        {
+            metrics.RecordDatabaseReadDuration(
+                Stopwatch.GetElapsedTime(databaseReadStarted));
+        }
 
         if (snapshot is null)
         {
+            metrics.RecordOutcome(AiExplanationQueryOutcome.NotFound);
             return Problem(
                 StatusCodes.Status404NotFound,
                 NotFoundCode,
@@ -92,7 +106,20 @@ public static class ReleaseRiskExplanationQueryEndpoint
                 "No durable inbox event exists for the supplied eventId.");
         }
 
-        return Results.Ok(ReleaseRiskExplanationQueryResponse.From(snapshot));
+        var response = ReleaseRiskExplanationQueryResponse.From(snapshot);
+        metrics.RecordOutcome(
+            snapshot switch
+            {
+                PendingReleaseRiskExplanationQuerySnapshot =>
+                    AiExplanationQueryOutcome.Pending,
+                CompletedReleaseRiskExplanationQuerySnapshot =>
+                    AiExplanationQueryOutcome.Completed,
+                FailedReleaseRiskExplanationQuerySnapshot =>
+                    AiExplanationQueryOutcome.Failed,
+                _ => throw new InvalidOperationException(
+                    "The AI explanation query snapshot has no observable outcome.")
+            });
+        return Results.Ok(response);
     }
 
     private static IResult Problem(

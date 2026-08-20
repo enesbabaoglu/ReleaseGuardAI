@@ -2,20 +2,20 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Açıkça etkinleştirilen .NET AI açıklama processor'ı accepted inbox satırlarını bounded claim/lease ile sahiplenir, retryable hataları sınırlı sayıda yeniden dener ve başarıyı ya da kalıcı terminal nedeni aynı `eventId` satırında birbirini ezemeyen sonuçlar olarak saklar. Operatör terminal işleri dar, salt-okunur failed-work sözleşmesinden inceleyebilir; yetkili bir servis ise yalnız inbox primary key'i olan `eventId` ile tek olayın `pending`, `completed` veya `failed` AI açıklama durumunu kesintisiz rotation için en fazla iki service-to-service Bearer credential kabul eden, configuration-bounded tek global per-instance istek bütçesiyle korunan salt-okunur HTTP query üzerinden okuyabilir. Manual replay, listeleme, ordering/latest-state, dashboard ve deploy henüz eklenmemiştir.
+Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Açıkça etkinleştirilen .NET AI açıklama processor'ı accepted inbox satırlarını bounded claim/lease ile sahiplenir, retryable hataları sınırlı sayıda yeniden dener ve başarıyı ya da kalıcı terminal nedeni aynı `eventId` satırında birbirini ezemeyen sonuçlar olarak saklar. Operatör terminal işleri dar, salt-okunur failed-work sözleşmesinden inceleyebilir; yetkili bir servis ise yalnız inbox primary key'i olan `eventId` ile tek olayın `pending`, `completed` veya `failed` AI açıklama durumunu kesintisiz rotation için en fazla iki service-to-service Bearer credential kabul eden, configuration-bounded tek global per-instance istek bütçesiyle korunan salt-okunur HTTP query üzerinden okuyabilir. Bu query yolu authentication/rate-limit kararlarını, bounded sonuç kümesini ve PostgreSQL read latency'sini hassas veya yüksek kardinaliteli etiket üretmeden .NET `Meter` instrument'larıyla görünür kılar. Manual replay, listeleme, ordering/latest-state, dashboard ve deploy henüz eklenmemiştir.
 
 ## Bu adımda ne yapıyoruz?
 
-- Yalnız `GET /v1/release-risk-events/{eventId}/ai-explanation` için başarılı authentication sonrasında, canonical `eventId` doğrulaması ve query/DB çağrısından önce tek global partition üzerinde sabit pencereli, configuration-bounded istek bütçesi uyguluyoruz.
-- Limiter kuyruk oluşturmaz. Pencerenin permit bütçesi dolduğunda yetkili isteği bekletmeden ayrıntı sızdırmayan stabil `429` problem body ve HTTP delta-seconds biçiminde bounded `Retry-After` ile reddeder; pencere dolduğunda bütçe atomik olarak yenilenir.
-- Active ve previous credential aynı singleton instance bütçesini paylaşır. Credential/key veya `eventId` partition'ı, kullanıcı/tenant modeli, rol matrisi ve credential bazlı kota eklemiyoruz.
-- Authentication önce çalışmaya devam eder: limiter dolu olsa da eksik/malformed/duplicate/yanlış credential mevcut stabil `401` body ve `WWW-Authenticate: Bearer` challenge'ını alır ve bütçe tüketmez. Buna karşılık yetkili istek permit aldıktan sonra route ve query değerlendirmesine geçer.
-- Mevcut `200` pending/completed/failed body'leri ile `400/404/503` problem body'lerini, authentication rotation'ını ve caller cancellation/bounded DB timeout ayrımını aynen koruyoruz. `/health` ve imzalı `POST /webhooks/github` bu bütçeye girmez.
-- Yeni migration veya mutasyon eklemiyoruz; mevcut V006 şemasını, webhook kabulünü, outbox'ı, Kafka V1 record'unu, durable-accept-then-commit sırasını, AI retry/terminal yaşam döngüsünü ve immutable success/terminal sonuçlarını değiştirmiyoruz.
+- Yalnız `GET /v1/release-risk-events/{eventId}/ai-explanation` için authentication failure, rate-limit permit kabulü ve `429` reddini ayrı etiketsiz `Counter<long>` instrument'larıyla sayıyoruz.
+- Query sonucunu tek `Counter<long>` üzerinde yalnız `outcome = pending|completed|failed|not_found|timeout` sabit kümesiyle kaydediyoruz. Active/previous credential, caller, tenant, repository veya `eventId` partition'ı/tag'i üretmiyoruz.
+- PostgreSQL read gerçekten başladığında elapsed süreyi ölçüp success, not-found, timeout, caller cancellation ve beklenmeyen exception yollarının hepsinde etiketsiz `Histogram<double>` üzerine milisaniye olarak kaydediyoruz. Authentication, `429` ve malformed GUID DB histogramına girmez.
+- `System.Diagnostics.Metrics`, DI `IMeterFactory` ve tek stabil meter/instrument ad kümesini kullanıyoruz. Exporter, scrape endpoint'i, dashboard, alarm veya deployment configuration eklemiyoruz; listener/exporter entegrasyonu ayrı kalıyor.
+- Mevcut authentication → global limiter → canonical GUID → bounded DB read sırasını; `401/200/400/404/429/503` body/header sözleşmelerini; caller cancellation/timeout ayrımını ve `/health` ile imzalı webhook davranışını aynen koruyoruz.
+- Yeni migration veya mutasyon eklemiyoruz; mevcut V006 şemasını, outbox/Kafka yaşam döngüsünü, durable-accept-then-commit sırasını ve immutable success/terminal sonuçlarını değiştirmiyoruz.
 
 ## Neden yapıyoruz?
 
-Yetkili bir polling istemcisi hata, yanlış interval veya retry fırtınası nedeniyle salt-okunur PostgreSQL yüzeyini sınırsız çağırmamalıdır. Bu adım her instance'ta sonlu permit/pencere değerleriyle query basıncını sınırlar ve aşımı istemciye yeniden deneme gecikmesiyle açıkça bildirir. Authentication başarısızlıkları limiter'dan önce `401` olduğu için bu bütçe brute-force koruması değildir; bu amaç gateway/ağ sınırında ayrıca ele alınmalıdır. Tek partition seçimi bütün yetkili çağrıları birlikte sınırlar fakat caller, credential veya event bazında adalet sözü vermez. Pending/success/terminal veri anlamı ve V006 değişmezlik kuralları rate limiting'den etkilenmez.
+Rate-limit değerlerini körlemesine seçmek authentication hatalarını, throttling oranını, query sonuç dağılımını veya PostgreSQL deadline baskısını görünmez bırakır. Bu adım düşük kardinaliteli instrument'larla operatöre permit/rejection dengesini, sonucu ve DB latency dağılımını ölçme zemini verir. Metrikler request davranışını değiştirmez, SLO/alert eşiği tanımlamaz ve deployment-wide kota kanıtı değildir. Credential veya event kimliği taşımadığı için tekil caller incelemesi sunmaz; bu bilinçli güvenlik/kardinalite trade-off'udur. Pending/success/terminal veri anlamı ve V006 değişmezlik kuralları metriklerden etkilenmez.
 
 ## Mimari kararlar
 
@@ -295,6 +295,24 @@ Authentication, rotation ve request limiter yalnız bu GET route'una endpoint s�
 
 Limiter process belleğinde ve **per-instance** çalışır. Birden fazla application instance'ının toplam throughput'u bu nedenle yaklaşık instance sayısıyla büyüyebilir; restart bütçeyi sıfırlar, rolling deployment sırasında pencere başlangıçları hizalanmayabilir ve configuration drift geçici farklı davranış yaratabilir. Bu uygulama deployment-wide toplam limit garantisi vermez. Böyle bir garanti gerekirse gateway/service-mesh veya paylaşımlı koordinasyon ayrı bir mimari sınır olarak eklenmelidir; mevcut dar limiter bu altyapıyı taklit etmez.
 
+### AI açıklama query metrik sözleşmesi
+
+Meter adı stabil `ReleaseGuard.WebhookIngestion.Api` değeridir. Bu checkpoint yalnız aşağıdaki beş instrument'ı üretir:
+
+| Instrument | Tür / birim | Tag kümesi | Kayıt anı |
+| --- | --- | --- | --- |
+| `releaseguard.ai_explanation_query.authentication_failures` | `Counter<long>` / `{request}` | Tag yok | Credential doğrulanamadığında, mevcut `401` dönmeden önce. |
+| `releaseguard.ai_explanation_query.rate_limit_permits` | `Counter<long>` / `{request}` | Tag yok | Başarılı authentication sonrası global permit alındığında; canonical GUID doğrulamasından önce. |
+| `releaseguard.ai_explanation_query.rate_limit_rejections` | `Counter<long>` / `{request}` | Tag yok | Başarılı authentication sonrası permit reddedildiğinde, stabil `429` dönmeden önce. |
+| `releaseguard.ai_explanation_query.outcomes` | `Counter<long>` / `{request}` | Yalnız `outcome = pending`, `completed`, `failed`, `not_found` veya `timeout` | Geçerli query sonucu response'a dönüştürüldüğünde, satır bulunmadığında veya bounded DB deadline dolduğunda. |
+| `releaseguard.ai_explanation_query.database_read_duration` | `Histogram<double>` / `ms` | Tag yok | Query portu gerçekten çağrıldıysa `finally` yolunda; success, not-found, timeout, caller cancellation ve beklenmeyen exception dahil. |
+
+Permit counter'ı rate-limit boundary'nin kararıdır; permit aldıktan sonra malformed GUID ile `400` olan istek de permit sayılır fakat DB histogramı veya outcome üretmez. Caller cancellation ve beklenmeyen query/contract exception'ı DB histogramına girer ama tamamlanmış bir HTTP/query sonucu olmadığı için outcome counter'ına girmez. Böylece outcome değer kümesi küçük ve anlamı nettir; permit ile outcome toplamlarının her zaman eşit olması beklenmez.
+
+Metric API'si `eventId`, credential/key, `Authorization`, active/previous eşleşmesi, repository, terminal failure code/reason, response body, exception message veya caller/tenant bilgisi kabul etmez. Outcome dışındaki instrument'lar tamamen etiketsizdir; outcome ise enum üzerinden yalnız yukarıdaki beş değere çevrilir ve bilinmeyen değer reddedilir. Bu sınır hem secret/iş verisi sızıntısını hem de kontrolsüz time-series kardinalitesini engeller. Bedeli, hangi credential'ın veya event'in trafiği ürettiğinin bu servis metriğinden ayırt edilememesidir.
+
+Instrument'lar .NET `IMeterFactory` üzerinden process içinde yayımlanır. Bu checkpoint OpenTelemetry/OTLP exporter, Prometheus `/metrics` endpoint'i, collector, dashboard veya alert oluşturmaz; ortam mevcut bir `MeterListener` ya da metrics pipeline ile meter adına açıkça abone olmalıdır. Counter/histogramlar instance kapsamındadır ve process restart/replica sınırlarını kendi başına birleştirmez. Filo toplamı, temporality, bucket görünümü ve retention seçimi harici metrics backend'inin sorumluluğudur; bu veriler deployment-wide rate-limit garantisi veya domain ordering/latest-state anlamı taşımaz.
+
 ### Outbox dispatcher claim, retry ve crash semantiği
 
 V003 mevcut outbox tablosuna şu alanları ekler:
@@ -466,6 +484,8 @@ Environment değişkenlerinde `:` yerine `__` kullanılır. Processor enabled de
 
 Environment karşılıkları `AiExplanationQuery__ReadTimeoutMilliseconds`, `AiExplanationQueryAuthentication__ActiveCredential`, geçici `AiExplanationQueryAuthentication__PreviousCredential`, `AiExplanationQueryRateLimit__PermitLimit` ve `AiExplanationQueryRateLimit__WindowMilliseconds` değerleridir. Credential için README veya checked-in appsettings değeri oluşturulmaz; deployment configuration anahtarlarını secret manager'dan host'a enjekte eder. Eksik/geçersiz rotation yapılandırması, sınır dışı timeout, permit veya pencere değeri `ValidateOnStart` sırasında uygulamayı durdurur. Limiter için disable ya da unbounded mode yoktur; anahtarlar verilmezse bounded `60` permit / `60000 ms` default'u kullanılır. Query deadline HTTP istemcisinin kendi timeout'undan bağımsızdır; istemci daha kısa sürede bağlantıyı keserse request cancellation önceliklidir ve `503` üretilmez. Timeout artırmak yavaş/kitlenmiş DB'yi sağlıklı hale getirmez; production timeout ve rate-limit değerleri bağlantı havuzu, normal query latency, polling ihtiyacı ve upstream timeout bütçesi birlikte ölçülerek seçilmelidir.
 
+Query metric instrument'ları için yeni application configuration anahtarı yoktur; stabil meter her host'ta DI `IMeterFactory` üzerinden kaydedilir ve listener yokken harici I/O yapmaz. Exporter endpoint'i, protocol, header/credential, sampling, histogram bucket'ı veya scrape route'u bu repoda yapılandırılmamıştır. Production metrics pipeline'ı yalnız `ReleaseGuard.WebhookIngestion.Api` meter'ına platform sınırında abone olmalı; exporter credential'ları gelecekte eklenirse mevcut query credential alanlarından kesinlikle ayrı tutulmalıdır.
+
 ## Yerel ortam bulguları
 
 İlk incelemede aşağıdaki araçlar doğrulandı:
@@ -514,6 +534,7 @@ ReleaseGuardAI/
 │       ├── AiExplanationProcessorOptions.cs
 │       ├── AiExplanationQueryAuthenticationOptions.cs
 │       ├── AiExplanationQueryAuthenticator.cs
+│       ├── AiExplanationQueryMetrics.cs
 │       ├── AiExplanationQueryOptions.cs
 │       ├── AiExplanationQueryRateLimitBoundary.cs
 │       ├── AiExplanationQueryRateLimitOptions.cs
@@ -559,6 +580,7 @@ ReleaseGuardAI/
         ├── AiExplanationProcessorOptionsTests.cs
         ├── AiExplanationQueryAuthenticationOptionsTests.cs
         ├── AiExplanationQueryAuthenticatorTests.cs
+        ├── AiExplanationQueryMetricsTests.cs
         ├── AiExplanationQueryOptionsTests.cs
         ├── AiExplanationQueryRateLimitBoundaryTests.cs
         ├── AiExplanationQueryRateLimitOptionsTests.cs
@@ -587,6 +609,7 @@ ReleaseGuardAI/
         ├── ReleaseRiskInboxProcessorTests.cs
         ├── ReleaseRiskOutboxDispatcherTests.cs
         ├── ReleaseRiskOutboxEnvelopeTests.cs
+        ├── TestAiExplanationQueryMetrics.cs
         └── TestApplicationFactory.cs
 ```
 
@@ -705,7 +728,7 @@ Yalnız AI açıklama processor options/unit testleriyle gerçek PostgreSQL owne
 dotnet test tests/ReleaseGuard.WebhookIngestion.Api.Tests --filter FullyQualifiedName~ExplanationProcessor
 ```
 
-Yalnız AI açıklama query authentication/options/rate-limit/HTTP birim testleriyle gerçek PostgreSQL authorization, ortak bütçe, reset, status, immutable read, timeout ve cancellation senaryolarını çalıştırmak için:
+Yalnız AI açıklama query authentication/options/rate-limit/metrics/HTTP birim testleriyle gerçek PostgreSQL authorization, ortak bütçe, düşük kardinaliteli ölçüm, status, immutable read, timeout ve cancellation senaryolarını çalıştırmak için:
 
 ```bash
 dotnet test tests/ReleaseGuard.WebhookIngestion.Api.Tests --filter FullyQualifiedName~ExplanationQuery
@@ -818,6 +841,8 @@ curl --fail-with-body \
 ```
 
 Çağıran servis active secret'ı kendi secret provider'ından almalıdır; credential URL/query içine konmamalı, loglanmamalı veya shell history'ye açık değer olarak yazılmamalıdır. Rotation penceresinde previous aynı response'u üretir; normal durumda previous anahtarı hiç bulunmamalıdır. Geçerli credential ile çağrı yalnız o `eventId` için yukarıdaki pending/completed/failed şekillerinden birini ya da bütçe doluysa stabil `429` + `Retry-After` döndürür. Polling istemcisi bu bounded gecikmeye uymalıdır. Inbox'a henüz kabul edilmemiş outbox/Kafka olayı `404` olur; query endpoint'i onu beklemez, publish etmez veya replay etmez.
+
+Bu çağrılar yukarıdaki stabil meter instrument'larını process içinde üretir; ek environment anahtarı gerekmez. Checked-in host bir metrics exporter veya `/metrics` endpoint'i açmadığı için harici gözlem ancak platformun `ReleaseGuard.WebhookIngestion.Api` meter'ına abone olan mevcut .NET/OpenTelemetry pipeline'ı ile yapılır. Query credential'ı metrics export için yeniden kullanılmamalıdır.
 
 GitHub webhook ayarında payload URL'sini `/webhooks/github`, content type'ı `application/json` ve secret'i uygulamaya verilen değerle aynı ayarlayın. GitHub her teslimatta gerekli `X-Hub-Signature-256`, `X-GitHub-Delivery` ve `X-GitHub-Event` başlıklarını gönderir. Geçerli bir `pull_request` / `synchronize` teslimatının örnek yanıtı şöyledir:
 
@@ -942,22 +967,22 @@ Bu sorgu yalnız terminal işleri okur; pending/başarılı işleri, raw Kafka p
 
 Bu adım aşağıdaki sırayla doğrulanır:
 
-1. Rate-limit options/validator testlerinin defaultları, permit `1–10000` ve pencere `100–3600000 ms` tam sınırlarını, sınır dışı değerleri ve gerçek host fail-fast davranışını kapsaması.
-2. Rate-limit boundary testlerinin tek global bütçede ilk `N` isteği kabul edip `N+1` isteği reddetmesi, concurrent yarışta tam configured permit kadar başarı vermesi, kalan pencereyi yukarı yuvarlanmış bounded `Retry-After` değerine çevirmesi ve pencere sınırında deterministik reset olması.
-3. Gerçek HTTP testinin başarısız authentication'ın permit tüketmediğini; dolu bütçede `401` önceliğini; limiter'ın canonical GUID ve query'den önce çalıştığını; active/previous ile farklı event ID'lerin aynı bütçeyi paylaştığını; stabil `429` body/`Retry-After` ve reset davranışını göstermesi.
-4. Gerçek uygulama + PostgreSQL 16 testinin durable pending satırı active ile okuduktan sonra previous çağrısını DB tablosu kilitliyken dahi `429` ile query öncesinde reddetmesi; invalid credential'a yine `401` vermesi; pencere resetinden sonra previous ile byte-eşit `200` üretmesi ve V006 satırını değiştirmemesi.
-5. Authentication options/authenticator testlerinin active/previous rotation kurallarını ve mevcut sabit-zamanlı digest karşılaştırmalarını; endpoint testlerinin mevcut `401/200/400/404/503`, pending/completed/failed body'lerini, caller cancellation ile gerçek DB timeout/recovery ayrımını koruması.
-6. Limit doluyken `/health` çağrısının etkilenmemesi; mevcut imzalı webhook, V001–V006 migration, outbox, Kafka producer/consumer, durable inbox, AI processor/DLQ, deterministic fake HTTP server ve gerçek local Uvicorn .NET→Python contract testlerinin değişmeden geçmesi.
+1. Production `MeterListener` testinin stabil meter/instrument adlarını, counter/histogram türlerini ve birimlerini; outcome dışındaki boş tag kümelerini; yalnız beş outcome değerini ve unknown outcome/negatif duration reddini doğrulaması.
+2. Gerçek HTTP testinin authentication failure'ın yalnız auth counter'ını; permit ve `429` kararlarının ayrı counter'ları; malformed GUID'nin permit fakat outcome/DB duration üretmemesini; pending/completed/failed/not-found/timeout yollarının sabit outcome değerlerini üretmesini göstermesi.
+3. Caller cancellation ve beklenmeyen query exception testlerinin sinyali aynen yayarken permit ve DB duration kaydetmesi fakat sahte outcome üretmemesi; mevcut timeout testinin `503` ve cancellation ayrımını koruması.
+4. Gerçek uygulama + PostgreSQL 16 testinin DB deadline timeout + recovery için iki etiketsiz duration ve sırasıyla timeout/pending outcome üretmesi; exhausted rate-limit sırasında kilitli DB'ye ulaşmayıp duration/outcome eklememesi; reset sonrası immutable satırı aynı body ile okuması.
+5. Metric API ve listener testlerinin `eventId`, credential/key, `Authorization`, failure reason/body, repository veya caller/tenant tag'i üretilemediğini; active/previous çağrıların metrikte ayırt edilmediğini kanıtlaması.
+6. Mevcut `401/200/400/404/429/503`, body/header, authentication rotation, rate-limit reset, caller cancellation/timeout, `/health`, imzalı webhook, V001–V006, outbox, Kafka, inbox, AI processor/DLQ ve gerçek local Uvicorn sözleşme testlerinin değişmeden geçmesi.
 7. Python Ruff lint/format ve Python 3.9 bytecode compile kontrolleri, tüm Python testleri, `.NET format`, restore, warning-as-error build ve gerçek PostgreSQL/Redpanda dahil tüm .NET testlerinin tamamlanması; entegrasyon testlerinin Docker yokken sessizce atlanmaması.
 
-Son doğrulamada Python Ruff lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; fail-fast rate-limit/rotation host'u, deterministic time provider, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `277/277 başarılı, 0 atlanan` sonucunu verdi. Toplam `319` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
+Son doğrulamada Python Ruff lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; production meter listener'ı, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `281/281 başarılı, 0 atlanan` sonucunu verdi. Toplam `323` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
 
 ## Sıradaki küçük adım
 
-Bu adım credential'dan bağımsız bounded request rate limiting'i yalnız `eventId` query route'unda tamamlar. Sonraki tek küçük adım yalnız aynı GET yüzeyine düşük kardinaliteli operasyonel gözlemlenebilirlik eklemek olmalıdır:
+Bu adım düşük kardinaliteli operasyonel metrikleri yalnız `eventId` query route'unda tamamlar. Sonraki tek küçük adım bu stabil meter'ı harici collector'a taşıyabilmek için yalnız opt-in, fail-fast doğrulanan OpenTelemetry OTLP metrics export wiring'i eklemek olmalıdır:
 
-- Authentication failure, permit kabulü, `429` reddi ve pending/completed/failed/not-found/timeout sonuçları için bounded counter'lar; PostgreSQL read için latency histogramı eklemek.
-- `eventId`, credential/key, `Authorization`, terminal failure reason, response body veya repository gibi hassas/yüksek kardinaliteli değerleri label ya da log alanı yapmamak; hangi active/previous credential'ın eşleştiğini görünür kılmamak.
-- Metrikleri rate-limit değerlerini ve query sağlığını ayarlamak için kullanmak; per-instance ölçümü deployment-wide quota, request ordering veya latest-state garantisi gibi sunmamak.
+- Export'u default kapalı tutmak; açıkken explicit OTLP endpoint/protocol ve bounded export interval/timeout değerlerini configuration'dan almak, eksik/geçersiz ayarda startup'ı durdurmak.
+- Yalnız `ReleaseGuard.WebhookIngestion.Api` meter'ına abone olmak; query credential'ını exporter credential'ı olarak yeniden kullanmamak ve exporter header/secret değerlerini response, log, metric tag veya repoya yazmamak.
+- Yeni `/metrics` route'u, dashboard/alert/SLO, trace/log pipeline, deployment manifesti veya başka servis instrument'ı eklememek; export hatasını HTTP query sonucuna çevirmemek.
 
-Sonraki checkpoint mevcut HTTP body/header sözleşmelerini, V006 şemasını, webhook kabulünü, outbox yayını, Kafka V1 sözleşmesini, durable-accept-then-commit sırasını ve immutable success/terminal sonuçlarını değiştirmemelidir.
+Sonraki checkpoint mevcut meter/instrument/tag kümesini, HTTP body/header sözleşmelerini, V006 şemasını, webhook kabulünü, outbox/Kafka yaşam döngüsünü, durable-accept-then-commit sırasını ve immutable success/terminal sonuçlarını değiştirmemelidir.

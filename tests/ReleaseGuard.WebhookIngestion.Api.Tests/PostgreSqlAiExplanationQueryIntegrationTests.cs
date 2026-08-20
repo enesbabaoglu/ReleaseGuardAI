@@ -158,10 +158,12 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
     public async Task Endpoint_WhenDatabaseReadDeadlineExpires_ReturnsStableTimeoutAndRemainsReadable()
     {
         var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
+        var metrics = new TestAiExplanationQueryMetrics();
         using var application = new PostgreSqlTestApplicationFactory(
             connectionString,
             applyMigrationsOnStartup: true,
-            queryReadTimeoutMilliseconds: 100);
+            queryReadTimeoutMilliseconds: 100,
+            queryMetrics: metrics);
         using var client = application.CreateClient();
         using var health = await client.GetAsync("/health");
         health.EnsureSuccessStatusCode();
@@ -203,6 +205,18 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
         Assert.Equal(
             "pending",
             recoveredBody.RootElement.GetProperty("status").GetString());
+        Assert.Equal(2, metrics.RateLimitPermits);
+        Assert.Equal(0, metrics.RateLimitRejections);
+        Assert.Equal(
+            [
+                AiExplanationQueryOutcome.Timeout,
+                AiExplanationQueryOutcome.Pending
+            ],
+            metrics.Outcomes);
+        Assert.Equal(2, metrics.DatabaseReadDurations.Count);
+        Assert.All(
+            metrics.DatabaseReadDurations,
+            duration => Assert.True(duration >= TimeSpan.Zero));
     }
 
     [Fact]
@@ -310,6 +324,7 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
     {
         var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
         var timeProvider = new ManualTimeProvider();
+        var metrics = new TestAiExplanationQueryMetrics();
         using var application = new PostgreSqlTestApplicationFactory(
             connectionString,
             applyMigrationsOnStartup: true,
@@ -318,7 +333,8 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
                 TestApplicationFactory.PreviousAiExplanationQueryCredential,
             rateLimitPermitLimit: 1,
             rateLimitWindowMilliseconds: 1_000,
-            rateLimitTimeProvider: timeProvider);
+            rateLimitTimeProvider: timeProvider,
+            queryMetrics: metrics);
         using var client = application.CreateClient();
         using (var health = await client.GetAsync("/health"))
         {
@@ -441,6 +457,16 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
             await ReadStoredSnapshotAsync(connectionString, envelope.EventId));
         using var healthAfterExhaustion = await client.GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, healthAfterExhaustion.StatusCode);
+        Assert.Equal(2, metrics.AuthenticationFailures);
+        Assert.Equal(2, metrics.RateLimitPermits);
+        Assert.Equal(2, metrics.RateLimitRejections);
+        Assert.Equal(
+            [
+                AiExplanationQueryOutcome.Pending,
+                AiExplanationQueryOutcome.Pending
+            ],
+            metrics.Outcomes);
+        Assert.Equal(2, metrics.DatabaseReadDurations.Count);
     }
 
     private async Task<string> CreateInitializedDatabaseAsync()

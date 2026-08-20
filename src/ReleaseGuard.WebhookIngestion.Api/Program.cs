@@ -4,6 +4,8 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddMetrics();
+
 builder.Services
     .AddOptions<GitHubWebhookOptions>()
     .BindConfiguration(GitHubWebhookOptions.SectionName)
@@ -132,6 +134,7 @@ builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<AiExplanationQueryAuthenticator>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<AiExplanationQueryRateLimitBoundary>();
+builder.Services.AddSingleton<IAiExplanationQueryMetrics, AiExplanationQueryMetrics>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
 builder.Services.AddHttpClient<

@@ -17,6 +17,7 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
     private readonly int _rateLimitPermitLimit;
     private readonly int _rateLimitWindowMilliseconds;
     private readonly TimeProvider? _rateLimitTimeProvider;
+    private readonly IAiExplanationQueryMetrics? _queryMetrics;
 
     public PostgreSqlTestApplicationFactory(
         string connectionString,
@@ -26,7 +27,8 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
         int rateLimitPermitLimit =
             AiExplanationQueryRateLimitOptions.MaximumPermitLimit,
         int rateLimitWindowMilliseconds = 60_000,
-        TimeProvider? rateLimitTimeProvider = null)
+        TimeProvider? rateLimitTimeProvider = null,
+        IAiExplanationQueryMetrics? queryMetrics = null)
     {
         _connectionString = connectionString;
         _applyMigrationsOnStartup = applyMigrationsOnStartup;
@@ -35,6 +37,7 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
         _rateLimitPermitLimit = rateLimitPermitLimit;
         _rateLimitWindowMilliseconds = rateLimitWindowMilliseconds;
         _rateLimitTimeProvider = rateLimitTimeProvider;
+        _queryMetrics = queryMetrics;
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -77,12 +80,21 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
             });
         });
 
-        if (_rateLimitTimeProvider is not null)
+        if (_rateLimitTimeProvider is not null || _queryMetrics is not null)
         {
             builder.ConfigureTestServices(services =>
             {
-                services.RemoveAll<TimeProvider>();
-                services.AddSingleton(_rateLimitTimeProvider);
+                if (_rateLimitTimeProvider is not null)
+                {
+                    services.RemoveAll<TimeProvider>();
+                    services.AddSingleton(_rateLimitTimeProvider);
+                }
+
+                if (_queryMetrics is not null)
+                {
+                    services.RemoveAll<IAiExplanationQueryMetrics>();
+                    services.AddSingleton(_queryMetrics);
+                }
             });
         }
     }
