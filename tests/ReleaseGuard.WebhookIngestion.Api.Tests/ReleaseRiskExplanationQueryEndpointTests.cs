@@ -133,6 +133,35 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
     }
 
     [Fact]
+    public async Task Get_DuringRotationAcceptsPreviousCredentialWithoutChangingBody()
+    {
+        using var application = new TestApplicationFactory(
+            TestApplicationFactory.AiExplanationQueryCredential,
+            TestApplicationFactory.PreviousAiExplanationQueryCredential);
+        var eventId = Guid.NewGuid();
+        application.ExplanationQuery.SetSnapshot(
+            eventId,
+            new PendingReleaseRiskExplanationQuerySnapshot(eventId));
+        using var client = application.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, Route(eventId));
+        request.Headers.TryAddWithoutValidation(
+            AiExplanationQueryAuthenticator.HeaderName,
+            $"Bearer {TestApplicationFactory.PreviousAiExplanationQueryCredential}");
+
+        using var response = await client.SendAsync(request);
+        using var body = await ReadJsonAsync(response);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(
+            ["eventId", "status"],
+            body.RootElement.EnumerateObject()
+                .Select(property => property.Name)
+                .ToArray());
+        Assert.Equal(eventId, body.RootElement.GetProperty("eventId").GetGuid());
+        Assert.Equal("pending", body.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
     public async Task Get_WithAuthenticationFailures_ReturnsIdenticalStableUnauthorizedBeforeQuery()
     {
         var eventId = Guid.NewGuid();
@@ -304,7 +333,7 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
         new(Options.Create(
             new AiExplanationQueryAuthenticationOptions
             {
-                Credential = TestApplicationFactory
+                ActiveCredential = TestApplicationFactory
                     .AiExplanationQueryCredential
             }));
 

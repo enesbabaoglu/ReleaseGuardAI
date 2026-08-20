@@ -12,7 +12,9 @@ public sealed class AiExplanationQueryAuthenticator : IDisposable
     public const string Challenge = Scheme;
 
     private const string HeaderPrefix = Scheme + " ";
-    private readonly byte[] _expectedCredentialDigest;
+    private readonly byte[] _activeCredentialDigest;
+    private readonly byte[] _previousCredentialDigest;
+    private readonly bool _hasPreviousCredential;
 
     public AiExplanationQueryAuthenticator(
         IOptions<AiExplanationQueryAuthenticationOptions> options)
@@ -21,15 +23,11 @@ public sealed class AiExplanationQueryAuthenticator : IDisposable
         var value = options.Value;
         AiExplanationQueryAuthenticationOptions.ThrowIfInvalid(value);
 
-        var credentialBytes = Encoding.UTF8.GetBytes(value.Credential);
-        try
-        {
-            _expectedCredentialDigest = SHA256.HashData(credentialBytes);
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(credentialBytes);
-        }
+        _activeCredentialDigest = CreateDigest(value.ActiveCredential);
+        _hasPreviousCredential = value.PreviousCredential is not null;
+        _previousCredentialDigest = _hasPreviousCredential
+            ? CreateDigest(value.PreviousCredential!)
+            : new byte[SHA256.HashSizeInBytes];
     }
 
     public bool IsAuthorized(StringValues authorizationHeader)
@@ -44,10 +42,15 @@ public sealed class AiExplanationQueryAuthenticator : IDisposable
             Span<byte> providedDigest = stackalloc byte[SHA256.HashSizeInBytes];
             SHA256.HashData(credentialBytes, providedDigest);
 
-            return CryptographicOperations.FixedTimeEquals(
-                       _expectedCredentialDigest,
-                       providedDigest) &&
-                   hasSingleBearerCredential;
+            var matchesActive = CryptographicOperations.FixedTimeEquals(
+                _activeCredentialDigest,
+                providedDigest);
+            var matchesPrevious = CryptographicOperations.FixedTimeEquals(
+                _previousCredentialDigest,
+                providedDigest);
+
+            return hasSingleBearerCredential &
+                   (matchesActive | (_hasPreviousCredential & matchesPrevious));
         }
         finally
         {
@@ -57,7 +60,21 @@ public sealed class AiExplanationQueryAuthenticator : IDisposable
 
     public void Dispose()
     {
-        CryptographicOperations.ZeroMemory(_expectedCredentialDigest);
+        CryptographicOperations.ZeroMemory(_activeCredentialDigest);
+        CryptographicOperations.ZeroMemory(_previousCredentialDigest);
+    }
+
+    private static byte[] CreateDigest(string credential)
+    {
+        var credentialBytes = Encoding.UTF8.GetBytes(credential);
+        try
+        {
+            return SHA256.HashData(credentialBytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(credentialBytes);
+        }
     }
 
     private static bool TryGetBearerCredential(

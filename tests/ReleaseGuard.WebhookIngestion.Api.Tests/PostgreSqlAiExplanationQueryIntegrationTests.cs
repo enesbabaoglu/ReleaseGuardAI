@@ -232,12 +232,14 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
     }
 
     [Fact]
-    public async Task Endpoint_RejectsMissingMalformedDuplicateAndWrongCredentialBeforeServingPostgreSqlState()
+    public async Task Endpoint_RotationAcceptsActiveAndPreviousButRejectsInvalidCredentialsBeforeServingPostgreSqlState()
     {
         var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
         using var application = new PostgreSqlTestApplicationFactory(
             connectionString,
-            applyMigrationsOnStartup: true);
+            applyMigrationsOnStartup: true,
+            queryPreviousCredential:
+                TestApplicationFactory.PreviousAiExplanationQueryCredential);
         using var client = application.CreateClient();
         using var health = await client.GetAsync("/health");
         health.EnsureSuccessStatusCode();
@@ -284,12 +286,23 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
         using var authorizedResponse = await SendAuthorizedAsync(
             client,
             Route(envelope.EventId));
-        using var authorizedBody = await ReadJsonAsync(authorizedResponse);
+        var activeBody = await authorizedResponse.Content.ReadAsStringAsync();
+        using var authorizedBody = JsonDocument.Parse(activeBody);
 
         Assert.Equal(HttpStatusCode.OK, authorizedResponse.StatusCode);
         Assert.Equal(
             "pending",
             authorizedBody.RootElement.GetProperty("status").GetString());
+
+        using var previousCredentialResponse = await SendAuthorizedAsync(
+            client,
+            Route(envelope.EventId),
+            TestApplicationFactory.PreviousAiExplanationQueryCredential);
+
+        Assert.Equal(HttpStatusCode.OK, previousCredentialResponse.StatusCode);
+        Assert.Equal(
+            activeBody,
+            await previousCredentialResponse.Content.ReadAsStringAsync());
     }
 
     private async Task<string> CreateInitializedDatabaseAsync()
@@ -359,12 +372,13 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
 
     private static async Task<HttpResponseMessage> SendAuthorizedAsync(
         HttpClient client,
-        string route)
+        string route,
+        string? credential = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, route);
         request.Headers.TryAddWithoutValidation(
             AiExplanationQueryAuthenticator.HeaderName,
-            $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}");
+            $"Bearer {credential ?? TestApplicationFactory.AiExplanationQueryCredential}");
         return await client.SendAsync(request);
     }
 

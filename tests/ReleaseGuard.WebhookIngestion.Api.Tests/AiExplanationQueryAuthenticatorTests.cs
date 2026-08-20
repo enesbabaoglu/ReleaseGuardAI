@@ -18,6 +18,21 @@ public sealed class AiExplanationQueryAuthenticatorTests
         Assert.False(authenticator.IsAuthorized(
             $"Basic {TestApplicationFactory.AiExplanationQueryCredential}"));
         Assert.False(authenticator.IsAuthorized("Bearer wrong-credential"));
+        Assert.False(authenticator.IsAuthorized(
+            $"Bearer {TestApplicationFactory.PreviousAiExplanationQueryCredential}"));
+    }
+
+    [Fact]
+    public void IsAuthorized_DuringRotationAcceptsActiveAndPreviousCredential()
+    {
+        using var authenticator = CreateAuthenticator(
+            TestApplicationFactory.PreviousAiExplanationQueryCredential);
+
+        Assert.True(authenticator.IsAuthorized(
+            $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}"));
+        Assert.True(authenticator.IsAuthorized(
+            $"Bearer {TestApplicationFactory.PreviousAiExplanationQueryCredential}"));
+        Assert.False(authenticator.IsAuthorized("Bearer wrong-credential"));
     }
 
     [Fact]
@@ -50,11 +65,13 @@ public sealed class AiExplanationQueryAuthenticatorTests
             () => new AiExplanationQueryAuthenticator(options));
     }
 
-    private static AiExplanationQueryAuthenticator CreateAuthenticator() =>
+    private static AiExplanationQueryAuthenticator CreateAuthenticator(
+        string? previousCredential = null) =>
         new(Options.Create(
             new AiExplanationQueryAuthenticationOptions
             {
-                Credential =
-                    TestApplicationFactory.AiExplanationQueryCredential
+                ActiveCredential =
+                    TestApplicationFactory.AiExplanationQueryCredential,
+                PreviousCredential = previousCredential
             }));
 }

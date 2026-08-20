@@ -10,15 +10,18 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
     private readonly string _connectionString;
     private readonly bool _applyMigrationsOnStartup;
     private readonly int _queryReadTimeoutMilliseconds;
+    private readonly string? _queryPreviousCredential;
 
     public PostgreSqlTestApplicationFactory(
         string connectionString,
         bool applyMigrationsOnStartup,
-        int queryReadTimeoutMilliseconds = 5_000)
+        int queryReadTimeoutMilliseconds = 5_000,
+        string? queryPreviousCredential = null)
     {
         _connectionString = connectionString;
         _applyMigrationsOnStartup = applyMigrationsOnStartup;
         _queryReadTimeoutMilliseconds = queryReadTimeoutMilliseconds;
+        _queryPreviousCredential = queryPreviousCredential;
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -48,8 +51,10 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                 [$"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds"] =
                     _queryReadTimeoutMilliseconds.ToString(
                         System.Globalization.CultureInfo.InvariantCulture),
-                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:Credential"] =
-                    TestApplicationFactory.AiExplanationQueryCredential
+                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:ActiveCredential"] =
+                    TestApplicationFactory.AiExplanationQueryCredential,
+                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:PreviousCredential"] =
+                    _queryPreviousCredential
             });
         });
     }

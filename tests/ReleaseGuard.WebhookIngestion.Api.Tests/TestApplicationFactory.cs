@@ -16,17 +16,23 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
     public const string GitHubWebhookSecret = "releaseguard-checkpoint-2-test-secret";
     public static string AiExplanationQueryCredential { get; } =
         Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+    public static string PreviousAiExplanationQueryCredential { get; } =
+        Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
 
-    private readonly string? _aiExplanationQueryCredential;
+    private readonly string? _activeAiExplanationQueryCredential;
+    private readonly string? _previousAiExplanationQueryCredential;
 
     public TestApplicationFactory()
-        : this(AiExplanationQueryCredential)
+        : this(AiExplanationQueryCredential, previousCredential: null)
     {
     }
 
-    internal TestApplicationFactory(string? aiExplanationQueryCredential)
+    internal TestApplicationFactory(
+        string? activeCredential,
+        string? previousCredential = null)
     {
-        _aiExplanationQueryCredential = aiExplanationQueryCredential;
+        _activeAiExplanationQueryCredential = activeCredential;
+        _previousAiExplanationQueryCredential = previousCredential;
     }
 
     public TestExplanationQuery ExplanationQuery { get; } = new();
@@ -54,8 +60,10 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
                     "http://127.0.0.1:8090",
                 [$"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds"] =
                     "100",
-                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:Credential"] =
-                    _aiExplanationQueryCredential
+                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:ActiveCredential"] =
+                    _activeAiExplanationQueryCredential,
+                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:PreviousCredential"] =
+                    _previousAiExplanationQueryCredential
             });
         });
 
