@@ -305,6 +305,144 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
             await previousCredentialResponse.Content.ReadAsStringAsync());
     }
 
+    [Fact]
+    public async Task Endpoint_RateLimitSharesRotationBudgetRejectsBeforeDatabaseAndResetsWithoutMutation()
+    {
+        var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
+        var timeProvider = new ManualTimeProvider();
+        using var application = new PostgreSqlTestApplicationFactory(
+            connectionString,
+            applyMigrationsOnStartup: true,
+            queryReadTimeoutMilliseconds: 100,
+            queryPreviousCredential:
+                TestApplicationFactory.PreviousAiExplanationQueryCredential,
+            rateLimitPermitLimit: 1,
+            rateLimitWindowMilliseconds: 1_000,
+            rateLimitTimeProvider: timeProvider);
+        using var client = application.CreateClient();
+        using (var health = await client.GetAsync("/health"))
+        {
+            health.EnsureSuccessStatusCode();
+        }
+
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var inboxStore = new PostgreSqlReleaseRiskInboxStore(dataSource);
+        var envelope = CreateEnvelope();
+        await AcceptAsync(inboxStore, envelope, offset: 0);
+        var snapshotBefore = await ReadStoredSnapshotAsync(
+            connectionString,
+            envelope.EventId);
+
+        using (var unauthorized = await SendAuthorizedAsync(
+                   client,
+                   "/v1/release-risk-events/not-a-guid/ai-explanation",
+                   "wrong-credential"))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
+        }
+
+        string activeBody;
+        using (var active = await SendAuthorizedAsync(
+                   client,
+                   Route(envelope.EventId)))
+        {
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+            activeBody = await active.Content.ReadAsStringAsync();
+        }
+
+        string rejectedBody;
+        await using (var blocker = new NpgsqlConnection(connectionString))
+        {
+            await blocker.OpenAsync();
+            await using var transaction = await blocker.BeginTransactionAsync();
+            await using var lockCommand = new NpgsqlCommand(
+                "LOCK TABLE release_risk_event_inbox IN ACCESS EXCLUSIVE MODE;",
+                blocker,
+                transaction);
+            await lockCommand.ExecuteNonQueryAsync();
+
+            using var rejected = await SendAuthorizedAsync(
+                client,
+                Route(envelope.EventId),
+                TestApplicationFactory.PreviousAiExplanationQueryCredential);
+            rejectedBody = await rejected.Content.ReadAsStringAsync();
+            using var body = JsonDocument.Parse(rejectedBody);
+
+            Assert.Equal(
+                HttpStatusCode.TooManyRequests,
+                rejected.StatusCode);
+            Assert.Equal(
+                ["code", "detail", "status", "title"],
+                body.RootElement.EnumerateObject()
+                    .Select(property => property.Name)
+                    .OrderBy(name => name, StringComparer.Ordinal)
+                    .ToArray());
+            Assert.Equal(
+                ReleaseRiskExplanationQueryEndpoint.RateLimitExceededCode,
+                body.RootElement.GetProperty("code").GetString());
+            Assert.Equal(
+                "AI explanation request rate limit exceeded.",
+                body.RootElement.GetProperty("title").GetString());
+            Assert.Equal(
+                "The request rate limit was exceeded. Retry after the indicated delay.",
+                body.RootElement.GetProperty("detail").GetString());
+            Assert.Equal(1, GetRetryAfterSeconds(rejected));
+            Assert.DoesNotContain(
+                envelope.EventId.ToString("D"),
+                rejectedBody,
+                StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(
+                TestApplicationFactory.PreviousAiExplanationQueryCredential,
+                rejectedBody,
+                StringComparison.Ordinal);
+
+            await transaction.RollbackAsync();
+        }
+
+        using (var unauthorizedAfterExhaustion = await SendAuthorizedAsync(
+                   client,
+                   Route(envelope.EventId),
+                   "wrong-credential"))
+        {
+            Assert.Equal(
+                HttpStatusCode.Unauthorized,
+                unauthorizedAfterExhaustion.StatusCode);
+        }
+
+        timeProvider.Advance(TimeSpan.FromMilliseconds(999));
+        using (var beforeReset = await SendAuthorizedAsync(
+                   client,
+                   Route(envelope.EventId),
+                   TestApplicationFactory.PreviousAiExplanationQueryCredential))
+        {
+            Assert.Equal(
+                HttpStatusCode.TooManyRequests,
+                beforeReset.StatusCode);
+            Assert.Equal(
+                rejectedBody,
+                await beforeReset.Content.ReadAsStringAsync());
+            Assert.Equal(1, GetRetryAfterSeconds(beforeReset));
+        }
+
+        timeProvider.Advance(TimeSpan.FromMilliseconds(1));
+        using (var afterReset = await SendAuthorizedAsync(
+                   client,
+                   Route(envelope.EventId),
+                   TestApplicationFactory.PreviousAiExplanationQueryCredential))
+        {
+            Assert.Equal(HttpStatusCode.OK, afterReset.StatusCode);
+            Assert.Equal(
+                activeBody,
+                await afterReset.Content.ReadAsStringAsync());
+        }
+
+        Assert.Equal(
+            snapshotBefore,
+            await ReadStoredSnapshotAsync(connectionString, envelope.EventId));
+        using var healthAfterExhaustion = await client.GetAsync("/health");
+        Assert.Equal(HttpStatusCode.OK, healthAfterExhaustion.StatusCode);
+    }
+
     private async Task<string> CreateInitializedDatabaseAsync()
     {
         var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
@@ -387,6 +525,14 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         return await JsonDocument.ParseAsync(stream);
+    }
+
+    private static int GetRetryAfterSeconds(HttpResponseMessage response)
+    {
+        var retryAfter = response.Headers.RetryAfter;
+        Assert.NotNull(retryAfter);
+        Assert.NotNull(retryAfter.Delta);
+        return checked((int)retryAfter.Delta.Value.TotalSeconds);
     }
 
     private static async Task<StoredSnapshot> ReadStoredSnapshotAsync(

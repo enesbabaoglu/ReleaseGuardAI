@@ -1,6 +1,9 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using ReleaseGuard.WebhookIngestion.Api;
 
 namespace ReleaseGuard.WebhookIngestion.Api.Tests;
@@ -11,17 +14,27 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
     private readonly bool _applyMigrationsOnStartup;
     private readonly int _queryReadTimeoutMilliseconds;
     private readonly string? _queryPreviousCredential;
+    private readonly int _rateLimitPermitLimit;
+    private readonly int _rateLimitWindowMilliseconds;
+    private readonly TimeProvider? _rateLimitTimeProvider;
 
     public PostgreSqlTestApplicationFactory(
         string connectionString,
         bool applyMigrationsOnStartup,
         int queryReadTimeoutMilliseconds = 5_000,
-        string? queryPreviousCredential = null)
+        string? queryPreviousCredential = null,
+        int rateLimitPermitLimit =
+            AiExplanationQueryRateLimitOptions.MaximumPermitLimit,
+        int rateLimitWindowMilliseconds = 60_000,
+        TimeProvider? rateLimitTimeProvider = null)
     {
         _connectionString = connectionString;
         _applyMigrationsOnStartup = applyMigrationsOnStartup;
         _queryReadTimeoutMilliseconds = queryReadTimeoutMilliseconds;
         _queryPreviousCredential = queryPreviousCredential;
+        _rateLimitPermitLimit = rateLimitPermitLimit;
+        _rateLimitWindowMilliseconds = rateLimitWindowMilliseconds;
+        _rateLimitTimeProvider = rateLimitTimeProvider;
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -54,8 +67,23 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                 [$"{AiExplanationQueryAuthenticationOptions.SectionName}:ActiveCredential"] =
                     TestApplicationFactory.AiExplanationQueryCredential,
                 [$"{AiExplanationQueryAuthenticationOptions.SectionName}:PreviousCredential"] =
-                    _queryPreviousCredential
+                    _queryPreviousCredential,
+                [$"{AiExplanationQueryRateLimitOptions.SectionName}:PermitLimit"] =
+                    _rateLimitPermitLimit.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture),
+                [$"{AiExplanationQueryRateLimitOptions.SectionName}:WindowMilliseconds"] =
+                    _rateLimitWindowMilliseconds.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture)
             });
         });
+
+        if (_rateLimitTimeProvider is not null)
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<TimeProvider>();
+                services.AddSingleton(_rateLimitTimeProvider);
+            });
+        }
     }
 }

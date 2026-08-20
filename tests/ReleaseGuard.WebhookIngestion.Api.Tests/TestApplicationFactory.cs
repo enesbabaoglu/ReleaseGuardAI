@@ -21,6 +21,9 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
 
     private readonly string? _activeAiExplanationQueryCredential;
     private readonly string? _previousAiExplanationQueryCredential;
+    private readonly int _rateLimitPermitLimit;
+    private readonly int _rateLimitWindowMilliseconds;
+    private readonly TimeProvider? _rateLimitTimeProvider;
 
     public TestApplicationFactory()
         : this(AiExplanationQueryCredential, previousCredential: null)
@@ -29,10 +32,17 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
 
     internal TestApplicationFactory(
         string? activeCredential,
-        string? previousCredential = null)
+        string? previousCredential = null,
+        int rateLimitPermitLimit =
+            AiExplanationQueryRateLimitOptions.MaximumPermitLimit,
+        int rateLimitWindowMilliseconds = 60_000,
+        TimeProvider? rateLimitTimeProvider = null)
     {
         _activeAiExplanationQueryCredential = activeCredential;
         _previousAiExplanationQueryCredential = previousCredential;
+        _rateLimitPermitLimit = rateLimitPermitLimit;
+        _rateLimitWindowMilliseconds = rateLimitWindowMilliseconds;
+        _rateLimitTimeProvider = rateLimitTimeProvider;
     }
 
     public TestExplanationQuery ExplanationQuery { get; } = new();
@@ -63,7 +73,13 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
                 [$"{AiExplanationQueryAuthenticationOptions.SectionName}:ActiveCredential"] =
                     _activeAiExplanationQueryCredential,
                 [$"{AiExplanationQueryAuthenticationOptions.SectionName}:PreviousCredential"] =
-                    _previousAiExplanationQueryCredential
+                    _previousAiExplanationQueryCredential,
+                [$"{AiExplanationQueryRateLimitOptions.SectionName}:PermitLimit"] =
+                    _rateLimitPermitLimit.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture),
+                [$"{AiExplanationQueryRateLimitOptions.SectionName}:WindowMilliseconds"] =
+                    _rateLimitWindowMilliseconds.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture)
             });
         });
 
@@ -74,6 +90,11 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
             services.AddSingleton<IGitHubWebhookDeliveryStore, TestDeliveryStore>();
             services.RemoveAll<IReleaseRiskExplanationQuery>();
             services.AddSingleton<IReleaseRiskExplanationQuery>(ExplanationQuery);
+            if (_rateLimitTimeProvider is not null)
+            {
+                services.RemoveAll<TimeProvider>();
+                services.AddSingleton(_rateLimitTimeProvider);
+            }
         });
     }
 

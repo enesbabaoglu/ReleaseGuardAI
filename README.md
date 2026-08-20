@@ -2,20 +2,20 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Açıkça etkinleştirilen .NET AI açıklama processor'ı accepted inbox satırlarını bounded claim/lease ile sahiplenir, retryable hataları sınırlı sayıda yeniden dener ve başarıyı ya da kalıcı terminal nedeni aynı `eventId` satırında birbirini ezemeyen sonuçlar olarak saklar. Operatör terminal işleri dar, salt-okunur failed-work sözleşmesinden inceleyebilir; yetkili bir servis ise yalnız inbox primary key'i olan `eventId` ile tek olayın `pending`, `completed` veya `failed` AI açıklama durumunu kesintisiz rotation için en fazla iki service-to-service Bearer credential kabul eden, bounded ve salt-okunur HTTP query üzerinden okuyabilir. Manual replay, listeleme, ordering/latest-state, dashboard ve deploy henüz eklenmemiştir.
+Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarında hem `opened` hem de `synchronize` action'larını dar bir `ReleaseRiskInput` nesnesine dönüştürür, deterministik bir risk değerlendirmesi üretir ve kabul sonucunu PostgreSQL'de kalıcılaştırır. Yeni `accepted` teslimatlar için aynı transaction'da sürümlü bir release-risk outbox envelope'u da oluşturur. Açıkça etkinleştirilen PostgreSQL outbox dispatcher bu satırları süreli claim/lease ile alıp Kafka'ya at-least-once yayımlar. Bağımsız Kafka consumer adapter'ı V1 record'u doğrular; açıkça etkinleştirilen inbox processor exact payload ile PostgreSQL'e idempotent kabulü tamamladıktan sonra ilgili Kafka offset'ini explicit commit eder. Ayrı Python AI açıklama servisi aynı V1 snapshot'ı sıkı biçimde doğrulayıp insan-okunur açıklama üretir. Açıkça etkinleştirilen .NET AI açıklama processor'ı accepted inbox satırlarını bounded claim/lease ile sahiplenir, retryable hataları sınırlı sayıda yeniden dener ve başarıyı ya da kalıcı terminal nedeni aynı `eventId` satırında birbirini ezemeyen sonuçlar olarak saklar. Operatör terminal işleri dar, salt-okunur failed-work sözleşmesinden inceleyebilir; yetkili bir servis ise yalnız inbox primary key'i olan `eventId` ile tek olayın `pending`, `completed` veya `failed` AI açıklama durumunu kesintisiz rotation için en fazla iki service-to-service Bearer credential kabul eden, configuration-bounded tek global per-instance istek bütçesiyle korunan salt-okunur HTTP query üzerinden okuyabilir. Manual replay, listeleme, ordering/latest-state, dashboard ve deploy henüz eklenmemiştir.
 
 ## Bu adımda ne yapıyoruz?
 
-- Yalnız `GET /v1/release-risk-events/{eventId}/ai-explanation` authentication sınırında zorunlu `ActiveCredential` ve rotation sırasında isteğe bağlı `PreviousCredential` kabul ediyoruz; `/health` ve imzalı `POST /webhooks/github` değişmez.
-- İki değer de yalnız secret/configuration provider'dan gelir, aynı `32–512` karakterlik Bearer-token kuralıyla startup'ta doğrulanır ve birlikte verildiklerinde farklı olmak zorundadır. Eksik/geçersiz active, boş/geçersiz previous veya aynı iki değer host'u fail-fast durdurur.
-- Sunulan credential tek kez SHA-256 özete dönüştürülür; active ve previous/dummy özetlerinin ikisi de erken eşleşme dönüşü olmadan `CryptographicOperations.FixedTimeEquals` ile karşılaştırılır. Previous kaldırıldığında eski credential aynı stabil `401` sonucuna döner.
-- Eksik, malformed, birden çok/birleştirilmiş duplicate veya iki yapılandırılmış değerle de eşleşmeyen `Authorization` header'larının tümü ayrıntı sızdırmayan mevcut stabil `401` body/challenge'ını korur.
-- Active ve previous credential için mevcut `200` pending/completed/failed body'leri ile `400/404/503` problem body'lerini aynen koruyoruz. Caller cancellation ile bounded DB timeout ayrımı değişmez.
+- Yalnız `GET /v1/release-risk-events/{eventId}/ai-explanation` için başarılı authentication sonrasında, canonical `eventId` doğrulaması ve query/DB çağrısından önce tek global partition üzerinde sabit pencereli, configuration-bounded istek bütçesi uyguluyoruz.
+- Limiter kuyruk oluşturmaz. Pencerenin permit bütçesi dolduğunda yetkili isteği bekletmeden ayrıntı sızdırmayan stabil `429` problem body ve HTTP delta-seconds biçiminde bounded `Retry-After` ile reddeder; pencere dolduğunda bütçe atomik olarak yenilenir.
+- Active ve previous credential aynı singleton instance bütçesini paylaşır. Credential/key veya `eventId` partition'ı, kullanıcı/tenant modeli, rol matrisi ve credential bazlı kota eklemiyoruz.
+- Authentication önce çalışmaya devam eder: limiter dolu olsa da eksik/malformed/duplicate/yanlış credential mevcut stabil `401` body ve `WWW-Authenticate: Bearer` challenge'ını alır ve bütçe tüketmez. Buna karşılık yetkili istek permit aldıktan sonra route ve query değerlendirmesine geçer.
+- Mevcut `200` pending/completed/failed body'leri ile `400/404/503` problem body'lerini, authentication rotation'ını ve caller cancellation/bounded DB timeout ayrımını aynen koruyoruz. `/health` ve imzalı `POST /webhooks/github` bu bütçeye girmez.
 - Yeni migration veya mutasyon eklemiyoruz; mevcut V006 şemasını, webhook kabulünü, outbox'ı, Kafka V1 record'unu, durable-accept-then-commit sırasını, AI retry/terminal yaşam döngüsünü ve immutable success/terminal sonuçlarını değiştirmiyoruz.
 
 ## Neden yapıyoruz?
 
-Tek credential doğrudan değiştirildiğinde rolling deployment'ın bir bölümündeki instance'lar veya henüz güncellenmemiş çağıran servisler geçici `401` alabilir. Bu adım en fazla iki credential'lık açık bir geçiş penceresiyle sunucu filosunun önce yeni active + eski previous değerini kabul etmesini, çağıranların daha sonra yeni değere geçmesini ve son olarak previous'ın kaldırılmasını sağlar. Bu pencere kullanıcı, tenant, rol veya key kimliği üretmez; iki credential da aynı service principal yetkisini temsil eder. Pending/success/terminal veri anlamı ve V006 değişmezlik kuralları authentication rotation'dan etkilenmez.
+Yetkili bir polling istemcisi hata, yanlış interval veya retry fırtınası nedeniyle salt-okunur PostgreSQL yüzeyini sınırsız çağırmamalıdır. Bu adım her instance'ta sonlu permit/pencere değerleriyle query basıncını sınırlar ve aşımı istemciye yeniden deneme gecikmesiyle açıkça bildirir. Authentication başarısızlıkları limiter'dan önce `401` olduğu için bu bütçe brute-force koruması değildir; bu amaç gateway/ağ sınırında ayrıca ele alınmalıdır. Tek partition seçimi bütün yetkili çağrıları birlikte sınırlar fakat caller, credential veya event bazında adalet sözü vermez. Pending/success/terminal veri anlamı ve V006 değişmezlik kuralları rate limiting'den etkilenmez.
 
 ## Mimari kararlar
 
@@ -207,6 +207,10 @@ Operatör sorgusu `release_risk_ai_explanation_failed_work` görünümüdür. G�
 
 `GET /v1/release-risk-events/{eventId}/ai-explanation` tam olarak bir `Authorization` header değeri ve `Bearer` scheme'i ister. Authentication route değeri ayrıştırılmadan ve query portu çağrılmadan önce çalışır. Eksik header, boş/malformed değer, iki ayrı header değeri, proxy tarafından virgülle birleştirilmiş duplicate değer veya yanlış credential aynı `401` sonucuna iner; böylece istemciye hangi parçanın yanlış olduğu ya da event'in varlığı açıklanmaz. Başarısız yanıtta yalnız generic problem alanları ve stabil `code = ai_explanation_authentication_failed` vardır; `WWW-Authenticate: Bearer` challenge'ı hata alt türü taşımaz.
 
+Başarılı authentication'dan sonraki kesin sıra `tek global rate-limit permit'i -> canonical D GUID doğrulaması -> bounded PostgreSQL read` biçimindedir. Limiter credential veya `eventId` almaz; application singleton'ı olduğu için active, previous ve bütün event kimlikleri aynı per-instance bütçeyi paylaşır. Authentication hataları permit tüketmez. Bütçe doluyken yanlış credential yine `401` alırken yetkili fakat malformed `eventId` de route ayrıştırılmadan `429` alır; reddedilen istekte query portu ve PostgreSQL hiç çağrılmaz.
+
+Boundary, limiter singleton'ı oluşturulduğunda başlayan sabit pencerede `PermitLimit` kadar isteği atomik olarak kabul eder. Permit request bitince geri verilmez; pencere sınırına gelindiğinde bütün bütçe birlikte yenilenir. Kuyruk bulunmadığı için limit aşımı yeni bekleme veya cancellation semantiği oluşturmaz. Sabit pencere basittir fakat iki komşu pencerenin sınırında kısa bir aralıkta yaklaşık iki pencere bütçesi kadar burst görülebilir.
+
 Active ve varsa previous credential en az 32, en fazla 512 karakterlik RFC Bearer-token alfabetine uygun, farklı yüksek entropili değerler olmalıdır. Doğrulayıcı yapılandırılmış açık değerleri saklamak yerine başlangıçta SHA-256 özetlerini alır. Sunulan değer tek kez aynı sabit uzunlukta özete çevrilir; active ve previous özetlerinin ikisi de her istekte `CryptographicOperations.FixedTimeEquals` ile karşılaştırılır, active eşleşmesinde erken dönülmez. Previous yapılandırılmadığında ikinci karşılaştırma yine sabit uzunluklu dummy özetle yapılır ve sonuç previous-yok bayrağıyla reddedilir. SHA-256 burada düşük entropili parolayı güvenli parola deposuna dönüştürmez; iki değer de secret manager'da üretilmiş yüksek entropili servis secret'ı olmalıdır. Bearer credential taşıma sırasında şifreleme sağlamadığından production trafiği uygulamada veya güvenilen gateway/service-mesh sınırında TLS kullanmalıdır.
 
 Kesintisiz rotation sırası şöyledir:
@@ -265,15 +269,31 @@ Hata sözleşmesi RFC problem JSON'una stabil `code` alanı ekler:
 | Durum | HTTP / code | Anlam |
 | --- | --- | --- |
 | Eksik, malformed, duplicate veya yanlış service credential | `401` / `ai_explanation_authentication_failed` | Aynı generic body döner; route/query değerlendirilmez. |
+| Yetkili istek için global pencere bütçesi dolu | `429` / `ai_explanation_rate_limit_exceeded` | Route/query değerlendirilmez; stabil body ile bounded `Retry-After` döner. |
 | Route değeri canonical `D` GUID değil | `400` / `malformed_event_id` | DB sorgusu çalıştırılmaz. |
 | GUID biçimi geçerli fakat inbox satırı yok | `404` / `ai_explanation_not_found` | Kimliğin webhook/outbox geçmişi hakkında ek bilgi verilmez. |
 | `AiExplanationQuery:ReadTimeoutMilliseconds` doldu | `503` / `ai_explanation_query_timeout` | Yokluk veya lifecycle durumu uydurulmaz; istemci daha sonra güvenle tekrar okuyabilir. |
 | Caller/request iptal edildi | HTTP sonucu üretilmez | Cancellation DB komutuna taşınır ve timeout/başarı olarak yeniden sınıflandırılmaz. |
 | Timeout dışı beklenmeyen DB/contract hatası | Framework `5xx` | Bozuk durumu sahte pending/failed yanıtına çevirmek yerine hata görünür kalır. |
 
+Limit aşımı body alan kümesi ve değerleri stabildir:
+
+```json
+{
+  "title": "AI explanation request rate limit exceeded.",
+  "status": 429,
+  "detail": "The request rate limit was exceeded. Retry after the indicated delay.",
+  "code": "ai_explanation_rate_limit_exceeded"
+}
+```
+
+`Retry-After` tek bir pozitif tam sayı delta-seconds değeridir. Kalan pencere süresi yukarı yuvarlanır; değer en az `1`, en çok doğrulanmış `WindowMilliseconds` değerinin saniye tavanıdır ve bugünkü configuration üst sınırı nedeniyle `3600` saniyeyi aşamaz. Body credential, key, `eventId`, event varlığı, permit sayısı veya pencere ayrıntısı içermez ve `429` yanıtında authentication challenge verilmez.
+
 Read deadline bağlantı havuzundan bağlantı alma, sorgu yürütme ve row okuma yolunun tamamına aynı linked cancellation token ile uygulanır. Deadline dolduğunda Npgsql komutu iptal edilir; in-flight SELECT herhangi bir mutasyon içermediği için belirsiz write sonucu yoktur. `503`, event'in bulunmadığı veya pending olduğu anlamına gelmez.
 
-Authentication ve rotation yalnız bu GET route'una endpoint sınırında eklenmiştir. `/health` credential istemez; GitHub webhook'u kendi ham-gövde HMAC sözleşmesini kullanmaya devam eder ve service credential kabul etmez. Active ve previous aynı çağıran servis yetkisini temsil eder; servisleri birbirinden ayırmaz, kullanıcı/tenant kimliği veya rol matrisi üretmez ve tek başına rate limit sağlamaz. Query listeleme, polling orchestration, manual replay/mutation, retention, dashboard, deploy kararı veya outbox/Kafka durumu eklenmemiştir.
+Authentication, rotation ve request limiter yalnız bu GET route'una endpoint sınırında eklenmiştir. `/health` credential istemez ve rate-limit permit'i tüketmez; GitHub webhook'u kendi ham-gövde HMAC sözleşmesini kullanmaya devam eder, service credential kabul etmez ve bu bütçeye girmez. Active ve previous aynı çağıran servis yetkisini ve aynı bütçeyi temsil eder; servisleri birbirinden ayırmaz, kullanıcı/tenant kimliği veya rol matrisi üretmez. Query listeleme, polling orchestration, manual replay/mutation, retention, dashboard, deploy kararı veya outbox/Kafka durumu eklenmemiştir.
+
+Limiter process belleğinde ve **per-instance** çalışır. Birden fazla application instance'ının toplam throughput'u bu nedenle yaklaşık instance sayısıyla büyüyebilir; restart bütçeyi sıfırlar, rolling deployment sırasında pencere başlangıçları hizalanmayabilir ve configuration drift geçici farklı davranış yaratabilir. Bu uygulama deployment-wide toplam limit garantisi vermez. Böyle bir garanti gerekirse gateway/service-mesh veya paylaşımlı koordinasyon ayrı bir mimari sınır olarak eklenmelidir; mevcut dar limiter bu altyapıyı taklit etmez.
 
 ### Outbox dispatcher claim, retry ve crash semantiği
 
@@ -312,6 +332,8 @@ Minimum uzunluk tahmin edilmesi kolay secret riskini azaltır. Trade-off: eski v
 PostgreSQL bağlantısı da yalnızca `PostgreSql:ConnectionString` yapılandırma anahtarından alınır; repoda gerçek bağlantı bilgisi veya parola yoktur. Boş, ayrıştırılamayan ya da `Host` / `Database` içermeyen değer `ValidateOnStart` ile uygulamayı durdurur. Bağlantı kurulamazsa veya şema beklenen sürümde değilse HTTP sunucusu trafik almadan startup başarısız olur. Bu, yanlış yapılandırılmış bir instance'ın bellek fallback'iyle sessizce idempotency kaybetmesini engeller.
 
 AI query service credential'ları yalnız `AiExplanationQueryAuthentication:ActiveCredential` ve `AiExplanationQueryAuthentication:PreviousCredential` anahtarlarından gelir. Repoda default veya örnek secret bulunmaz; local ortamda environment configuration, production'da platform secret manager/configuration provider kullanılmalıdır. Active zorunludur; previous yalnız rotation penceresinde verilir. İki değer aynı biçim/sınır kurallarına uymalı ve birbirinden farklı olmalıdır. Eksik/geçersiz active, verilmiş fakat geçersiz previous veya aynı iki değer `IValidateOptions` + `ValidateOnStart` ile host'u durdurur. Trade-off: eski `Credential` anahtarına fallback ya da credential'sız compatibility modu yoktur; deployment yeni binary başlamadan mevcut secret'ı active anahtarına eşlemelidir.
+
+Query rate-limit bütçesi credential secret'larından ayrı `AiExplanationQueryRateLimit` options bölümündedir. Permit ve pencere değerleri `IValidateOptions` + `ValidateOnStart` ile bounded doğrulanır; credential değeri, kimliği veya eşleşen active/previous bilgisi limiter configuration'ına ya da partition anahtarına taşınmaz.
 
 ### Migration ve startup stratejisi
 
@@ -432,15 +454,17 @@ Eksik/geçersiz yapılandırma `releaseguard_ai.main` yüklenirken açıkça sta
 
 Environment değişkenlerinde `:` yerine `__` kullanılır. Processor enabled değilse lifecycle satırları durable pending kalır; bu güvenli default bir başarı veya drop sayılmaz. Enabled instance batch içinde bounded paralellik kullanır. `MaximumAttempts`, aynı event için provider'ın kesin çağrı sayısı değildir: HTTP başlamadan önce crash olan claim de attempt sayılır, timeout sonrası uzak servis çağrıyı işlemiş olabilir. Bu muhafazakâr sınır sonsuz maliyeti engeller; operatör failed-work reason ve envelope üzerinden sonucu inceleyebilir. Jitter ve manual replay yoktur.
 
-### .NET AI açıklama query ve authentication yapılandırması
+### .NET AI açıklama query, authentication ve rate-limit yapılandırması
 
 | Configuration anahtarı | Kural |
 | --- | --- |
 | `AiExplanationQuery:ReadTimeoutMilliseconds` | Tek event PostgreSQL okumasının tamamı için `100–30000 ms`; default `5000`. |
 | `AiExplanationQueryAuthentication:ActiveCredential` | Zorunlu `32–512` karakterlik yüksek entropili Bearer-token değeri; default yoktur. |
 | `AiExplanationQueryAuthentication:PreviousCredential` | Yalnız rotation penceresinde isteğe bağlı; verilirse active ile aynı biçim kuralına uymalı ve ondan farklı olmalıdır. |
+| `AiExplanationQueryRateLimit:PermitLimit` | Tek sabit penceredeki global per-instance istek bütçesi; `1–10000`, default `60`. |
+| `AiExplanationQueryRateLimit:WindowMilliseconds` | Bütçe penceresi ve `Retry-After` üst sınırının kaynağı; `100–3600000 ms`, default `60000`. |
 
-Environment karşılıkları `AiExplanationQuery__ReadTimeoutMilliseconds`, `AiExplanationQueryAuthentication__ActiveCredential` ve geçici `AiExplanationQueryAuthentication__PreviousCredential` değerleridir. Credential için README veya checked-in appsettings değeri oluşturulmaz; deployment configuration anahtarlarını secret manager'dan host'a enjekte eder. Eksik/geçersiz rotation yapılandırması ile sınır dışı timeout `ValidateOnStart` sırasında uygulamayı durdurur. Query deadline HTTP istemcisinin kendi timeout'undan bağımsızdır; istemci daha kısa sürede bağlantıyı keserse request cancellation önceliklidir ve `503` üretilmez. Timeout artırmak yavaş/kitlenmiş DB'yi sağlıklı hale getirmez; production değeri bağlantı havuzu, normal query latency ve upstream timeout bütçesi birlikte ölçülerek seçilmelidir.
+Environment karşılıkları `AiExplanationQuery__ReadTimeoutMilliseconds`, `AiExplanationQueryAuthentication__ActiveCredential`, geçici `AiExplanationQueryAuthentication__PreviousCredential`, `AiExplanationQueryRateLimit__PermitLimit` ve `AiExplanationQueryRateLimit__WindowMilliseconds` değerleridir. Credential için README veya checked-in appsettings değeri oluşturulmaz; deployment configuration anahtarlarını secret manager'dan host'a enjekte eder. Eksik/geçersiz rotation yapılandırması, sınır dışı timeout, permit veya pencere değeri `ValidateOnStart` sırasında uygulamayı durdurur. Limiter için disable ya da unbounded mode yoktur; anahtarlar verilmezse bounded `60` permit / `60000 ms` default'u kullanılır. Query deadline HTTP istemcisinin kendi timeout'undan bağımsızdır; istemci daha kısa sürede bağlantıyı keserse request cancellation önceliklidir ve `503` üretilmez. Timeout artırmak yavaş/kitlenmiş DB'yi sağlıklı hale getirmez; production timeout ve rate-limit değerleri bağlantı havuzu, normal query latency, polling ihtiyacı ve upstream timeout bütçesi birlikte ölçülerek seçilmelidir.
 
 ## Yerel ortam bulguları
 
@@ -491,6 +515,8 @@ ReleaseGuardAI/
 │       ├── AiExplanationQueryAuthenticationOptions.cs
 │       ├── AiExplanationQueryAuthenticator.cs
 │       ├── AiExplanationQueryOptions.cs
+│       ├── AiExplanationQueryRateLimitBoundary.cs
+│       ├── AiExplanationQueryRateLimitOptions.cs
 │       ├── Database/Migrations/
 │       │   ├── V001__create_github_webhook_deliveries.sql
 │       │   ├── V002__create_release_risk_outbox.sql
@@ -534,6 +560,8 @@ ReleaseGuardAI/
         ├── AiExplanationQueryAuthenticationOptionsTests.cs
         ├── AiExplanationQueryAuthenticatorTests.cs
         ├── AiExplanationQueryOptionsTests.cs
+        ├── AiExplanationQueryRateLimitBoundaryTests.cs
+        ├── AiExplanationQueryRateLimitOptionsTests.cs
         ├── GitHubWebhookEndpointTests.cs
         ├── HealthEndpointTests.cs
         ├── HttpReleaseRiskExplanationClientTests.cs
@@ -542,6 +570,7 @@ ReleaseGuardAI/
         ├── KafkaProducerOptionsTests.cs
         ├── KafkaReleaseRiskEventConsumerIntegrationTests.cs
         ├── KafkaReleaseRiskEventProducerIntegrationTests.cs
+        ├── ManualTimeProvider.cs
         ├── OutboxDispatcherOptionsTests.cs
         ├── PostgreSqlAiExplanationQueryIntegrationTests.cs
         ├── PostgreSqlAiExplanationProcessorIntegrationTests.cs
@@ -676,7 +705,7 @@ Yalnız AI açıklama processor options/unit testleriyle gerçek PostgreSQL owne
 dotnet test tests/ReleaseGuard.WebhookIngestion.Api.Tests --filter FullyQualifiedName~ExplanationProcessor
 ```
 
-Yalnız AI açıklama query authentication/options/HTTP birim testleriyle gerçek PostgreSQL authorization, status, immutable read, timeout ve cancellation senaryolarını çalıştırmak için:
+Yalnız AI açıklama query authentication/options/rate-limit/HTTP birim testleriyle gerçek PostgreSQL authorization, ortak bütçe, reset, status, immutable read, timeout ve cancellation senaryolarını çalıştırmak için:
 
 ```bash
 dotnet test tests/ReleaseGuard.WebhookIngestion.Api.Tests --filter FullyQualifiedName~ExplanationQuery
@@ -754,6 +783,8 @@ export AiExplanationProcessor__MaximumRetryDelayMilliseconds=60000
 export AiExplanationProcessor__MaximumAttempts=5
 export AiExplanationProcessor__StateUpdateTimeoutMilliseconds=5000
 export AiExplanationQuery__ReadTimeoutMilliseconds=5000
+export AiExplanationQueryRateLimit__PermitLimit=60
+export AiExplanationQueryRateLimit__WindowMilliseconds=60000
 dotnet run --project src/ReleaseGuard.WebhookIngestion.Api -- --urls http://localhost:5080
 ```
 
@@ -764,7 +795,7 @@ export PostgreSql__ApplyMigrationsOnStartup=false
 dotnet run --project src/ReleaseGuard.WebhookIngestion.Api -- --urls http://localhost:5080
 ```
 
-Migration bayrağı hiç verilmezse `false` kabul edilir. V006'ya ulaşmamış veritabanında false ile açılış bilinçli olarak başarısızdır; şema kendiliğinden veya bellek fallback'iyle oluşturulmaz. Kafka producer/consumer bootstrap servers, aynı topic, consumer group ID, bounded consume/broker request timeout'u ile dispatcher/inbox processor, AI query read-timeout ve active/previous authentication ayarları eksik veya geçersizse uygulama options validation ile startup'ta durur. `OutboxDispatcher__Enabled`, `InboxProcessor__Enabled` ve `AiExplanationProcessor__Enabled` verilmezse güvenli default `false` olur; pending outbox yayımlanmaz, consumer client oluşturulup record okunmaz ve accepted inbox satırları AI için claim edilmez. Query endpoint'i worker enable bayraklarından bağımsız olarak mevcut committed inbox satırını salt-okunur okuyabilir, fakat her durumda active veya geçici previous Bearer credential ister. Dispatcher publish hatalarını kalıcı capped backoff'a dönüştürür. AI processor retryable hataları configured attempt sınırına kadar backoff ile dener; terminal sınıfları ve son retryable denemeyi kalıcı failed state'e taşır. Inbox processor etkin olduğunda ilk güvenli olmayan DB/contract/commit hatası worker'ı durdurur; Kafka offset commit'i AI çağrısını beklemez.
+Migration bayrağı hiç verilmezse `false` kabul edilir. V006'ya ulaşmamış veritabanında false ile açılış bilinçli olarak başarısızdır; şema kendiliğinden veya bellek fallback'iyle oluşturulmaz. Kafka producer/consumer bootstrap servers, aynı topic, consumer group ID, bounded consume/broker request timeout'u ile dispatcher/inbox processor, AI query read-timeout, active/previous authentication ve rate-limit permit/pencere ayarları geçersizse uygulama options validation ile startup'ta durur. `OutboxDispatcher__Enabled`, `InboxProcessor__Enabled` ve `AiExplanationProcessor__Enabled` verilmezse güvenli default `false` olur; pending outbox yayımlanmaz, consumer client oluşturulup record okunmaz ve accepted inbox satırları AI için claim edilmez. Query endpoint'i worker enable bayraklarından bağımsız olarak mevcut committed inbox satırını salt-okunur okuyabilir, fakat her durumda active veya geçici previous Bearer credential ister ve bounded global per-instance bütçeye girer. Dispatcher publish hatalarını kalıcı capped backoff'a dönüştürür. AI processor retryable hataları configured attempt sınırına kadar backoff ile dener; terminal sınıfları ve son retryable denemeyi kalıcı failed state'e taşır. Inbox processor etkin olduğunda ilk güvenli olmayan DB/contract/commit hatası worker'ı durdurur; Kafka offset commit'i AI çağrısını beklemez.
 
 Başka bir terminalden sağlık kontrolü:
 
@@ -786,7 +817,7 @@ curl --fail-with-body \
   http://localhost:5080/v1/release-risk-events/0b989ba4-242f-11e5-81e1-c7b6966d2516/ai-explanation
 ```
 
-Çağıran servis active secret'ı kendi secret provider'ından almalıdır; credential URL/query içine konmamalı, loglanmamalı veya shell history'ye açık değer olarak yazılmamalıdır. Rotation penceresinde previous aynı response'u üretir; normal durumda previous anahtarı hiç bulunmamalıdır. Geçerli credential ile çağrı yalnız o `eventId` için yukarıdaki pending/completed/failed şekillerinden birini döndürür. Inbox'a henüz kabul edilmemiş outbox/Kafka olayı `404` olur; query endpoint'i onu beklemez, publish etmez veya replay etmez.
+Çağıran servis active secret'ı kendi secret provider'ından almalıdır; credential URL/query içine konmamalı, loglanmamalı veya shell history'ye açık değer olarak yazılmamalıdır. Rotation penceresinde previous aynı response'u üretir; normal durumda previous anahtarı hiç bulunmamalıdır. Geçerli credential ile çağrı yalnız o `eventId` için yukarıdaki pending/completed/failed şekillerinden birini ya da bütçe doluysa stabil `429` + `Retry-After` döndürür. Polling istemcisi bu bounded gecikmeye uymalıdır. Inbox'a henüz kabul edilmemiş outbox/Kafka olayı `404` olur; query endpoint'i onu beklemez, publish etmez veya replay etmez.
 
 GitHub webhook ayarında payload URL'sini `/webhooks/github`, content type'ı `application/json` ve secret'i uygulamaya verilen değerle aynı ayarlayın. GitHub her teslimatta gerekli `X-Hub-Signature-256`, `X-GitHub-Delivery` ve `X-GitHub-Event` başlıklarını gönderir. Geçerli bir `pull_request` / `synchronize` teslimatının örnek yanıtı şöyledir:
 
@@ -911,22 +942,22 @@ Bu sorgu yalnız terminal işleri okur; pending/başarılı işleri, raw Kafka p
 
 Bu adım aşağıdaki sırayla doğrulanır:
 
-1. Authentication options/validator testlerinin zorunlu active ile absent previous'ı; farklı ve geçerli iki credential'ı; eksik/kısa/fazla uzun/malformed active veya previous'ı ve aynı iki değeri kapsaması. Gerçek host'un bütün geçersiz rotation yapılandırmalarında fail-fast durması.
-2. Authenticator testlerinin previous yokken yalnız active'i, rotation sırasında active ve previous'ı kabul etmesi; previous kaldırıldığında eski değeri reddetmesi. Kod yolunun previous absent olsa da iki sabit-zamanlı digest karşılaştırmasını erken dönüş olmadan çalıştırması.
-3. Gerçek HTTP testinin previous credential ile mevcut pending body alan kümesini aynen koruması; eksik, malformed, duplicate ve yanlış değerler için stabil `401` body/challenge'ın değişmemesi.
-4. Gerçek uygulama + PostgreSQL 16 testinin aynı durable pending satır için active ve previous ile byte-eşit `200` body döndürmesi; hiçbir credential'la eşleşmeyen yolları aynı `401` ile query öncesinde reddetmesi.
-5. Active credential ile pending/completed/failed, canonical event ID, `400/404/503`, immutable snapshot, caller cancellation, gerçek DB timeout ve recovery regresyonlarının değişmeden geçmesi.
-6. Mevcut V001–V006 migration, `/health`, imzalı webhook, outbox, Kafka producer/consumer, durable inbox, AI processor/DLQ, deterministic fake HTTP server ve gerçek local Uvicorn .NET→Python contract testlerinin değişmeden geçmesi.
+1. Rate-limit options/validator testlerinin defaultları, permit `1–10000` ve pencere `100–3600000 ms` tam sınırlarını, sınır dışı değerleri ve gerçek host fail-fast davranışını kapsaması.
+2. Rate-limit boundary testlerinin tek global bütçede ilk `N` isteği kabul edip `N+1` isteği reddetmesi, concurrent yarışta tam configured permit kadar başarı vermesi, kalan pencereyi yukarı yuvarlanmış bounded `Retry-After` değerine çevirmesi ve pencere sınırında deterministik reset olması.
+3. Gerçek HTTP testinin başarısız authentication'ın permit tüketmediğini; dolu bütçede `401` önceliğini; limiter'ın canonical GUID ve query'den önce çalıştığını; active/previous ile farklı event ID'lerin aynı bütçeyi paylaştığını; stabil `429` body/`Retry-After` ve reset davranışını göstermesi.
+4. Gerçek uygulama + PostgreSQL 16 testinin durable pending satırı active ile okuduktan sonra previous çağrısını DB tablosu kilitliyken dahi `429` ile query öncesinde reddetmesi; invalid credential'a yine `401` vermesi; pencere resetinden sonra previous ile byte-eşit `200` üretmesi ve V006 satırını değiştirmemesi.
+5. Authentication options/authenticator testlerinin active/previous rotation kurallarını ve mevcut sabit-zamanlı digest karşılaştırmalarını; endpoint testlerinin mevcut `401/200/400/404/503`, pending/completed/failed body'lerini, caller cancellation ile gerçek DB timeout/recovery ayrımını koruması.
+6. Limit doluyken `/health` çağrısının etkilenmemesi; mevcut imzalı webhook, V001–V006 migration, outbox, Kafka producer/consumer, durable inbox, AI processor/DLQ, deterministic fake HTTP server ve gerçek local Uvicorn .NET→Python contract testlerinin değişmeden geçmesi.
 7. Python Ruff lint/format ve Python 3.9 bytecode compile kontrolleri, tüm Python testleri, `.NET format`, restore, warning-as-error build ve gerçek PostgreSQL/Redpanda dahil tüm .NET testlerinin tamamlanması; entegrasyon testlerinin Docker yokken sessizce atlanmaması.
 
-Son doğrulamada Python Ruff lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; fail-fast rotation host'u, deterministic fake server, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `260/260 başarılı, 0 atlanan` sonucunu verdi. Toplam `302` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
+Son doğrulamada Python Ruff lint/format/compile kontrolleri başarılı ve Python testleri `42/42 başarılı` oldu. `.NET format` ve restore başarılı, build `0 uyarı / 0 hata`; fail-fast rate-limit/rotation host'u, deterministic time provider, gerçek local Uvicorn process'i, PostgreSQL 16 ve Redpanda senaryoları dahil .NET testleri `277/277 başarılı, 0 atlanan` sonucunu verdi. Toplam `319` test başarılıdır. Testcontainers için Docker Engine ve Docker socket erişimi, cross-service test için README'deki Python `.venv` kurulumu gerekir; PostgreSQL, Kafka veya Python process entegrasyonları sessizce atlanmaz.
 
 ## Sıradaki küçük adım
 
-Bu adım en fazla iki service credential ile kesintisiz rotation'ı yalnız `eventId` query route'unda tamamlar. Sonraki tek küçük adım yalnız aynı GET yüzeyine bounded, credential'dan bağımsız request rate limiting eklemek olmalıdır:
+Bu adım credential'dan bağımsız bounded request rate limiting'i yalnız `eventId` query route'unda tamamlar. Sonraki tek küçük adım yalnız aynı GET yüzeyine düşük kardinaliteli operasyonel gözlemlenebilirlik eklemek olmalıdır:
 
-- Authentication sonrasında, route/query değerlendirmesinden önce tek global partition üzerinde configuration ile bounded bir istek bütçesi uygulamak; limit aşımında ayrıntı sızdırmayan stabil `429` ve bounded `Retry-After` döndürmek.
-- Active ve previous credential'a aynı bütçeyi uygulamak; credential/key kimliği, kullanıcı/tenant modeli, rol matrisi veya credential bazlı kota üretmemek. Per-instance limitin çok-instance toplam limiti garanti etmediğini açık trade-off olarak belgelemek.
-- Mevcut `401/200/400/404/503`, cancellation/timeout ve immutable query body sözleşmelerini korumak; `/health`, imzalı GitHub webhook, listeleme, ordering/latest-state, replay/mutation, dashboard, deploy, retention ve outbox/Kafka yaşam döngüsünü değiştirmemek.
+- Authentication failure, permit kabulü, `429` reddi ve pending/completed/failed/not-found/timeout sonuçları için bounded counter'lar; PostgreSQL read için latency histogramı eklemek.
+- `eventId`, credential/key, `Authorization`, terminal failure reason, response body veya repository gibi hassas/yüksek kardinaliteli değerleri label ya da log alanı yapmamak; hangi active/previous credential'ın eşleştiğini görünür kılmamak.
+- Metrikleri rate-limit değerlerini ve query sağlığını ayarlamak için kullanmak; per-instance ölçümü deployment-wide quota, request ordering veya latest-state garantisi gibi sunmamak.
 
-Sonraki checkpoint mevcut V006 şemasını, webhook kabulünü, outbox yayını, Kafka V1 sözleşmesini, durable-accept-then-commit sırasını ve immutable success/terminal sonuçlarını değiştirmemelidir.
+Sonraki checkpoint mevcut HTTP body/header sözleşmelerini, V006 şemasını, webhook kabulünü, outbox yayını, Kafka V1 sözleşmesini, durable-accept-then-commit sırasını ve immutable success/terminal sonuçlarını değiştirmemelidir.

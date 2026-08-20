@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 
@@ -12,11 +13,14 @@ public static class ReleaseRiskExplanationQueryEndpoint
     public const string QueryTimeoutCode = "ai_explanation_query_timeout";
     public const string AuthenticationFailedCode =
         "ai_explanation_authentication_failed";
+    public const string RateLimitExceededCode =
+        "ai_explanation_rate_limit_exceeded";
 
     public static async Task<IResult> HandleAsync(
         HttpRequest request,
         string eventId,
         AiExplanationQueryAuthenticator authenticator,
+        AiExplanationQueryRateLimitBoundary rateLimitBoundary,
         IReleaseRiskExplanationQuery query,
         IOptions<AiExplanationQueryOptions> options,
         CancellationToken cancellationToken)
@@ -31,6 +35,19 @@ public static class ReleaseRiskExplanationQueryEndpoint
                 AuthenticationFailedCode,
                 "Authentication failed.",
                 "The request could not be authenticated.");
+        }
+
+        var rateLimitDecision = rateLimitBoundary.AttemptAcquire();
+        if (!rateLimitDecision.IsAcquired)
+        {
+            request.HttpContext.Response.Headers.RetryAfter =
+                rateLimitDecision.RetryAfterSeconds
+                    .ToString(CultureInfo.InvariantCulture);
+            return Problem(
+                StatusCodes.Status429TooManyRequests,
+                RateLimitExceededCode,
+                "AI explanation request rate limit exceeded.",
+                "The request rate limit was exceeded. Retry after the indicated delay.");
         }
 
         if (!Guid.TryParseExact(eventId, "D", out var parsedEventId))

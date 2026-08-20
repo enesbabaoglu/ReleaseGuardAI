@@ -120,8 +120,18 @@ builder.Services.AddSingleton<
     IValidateOptions<AiExplanationQueryAuthenticationOptions>,
     AiExplanationQueryAuthenticationOptionsValidator>();
 
+builder.Services
+    .AddOptions<AiExplanationQueryRateLimitOptions>()
+    .BindConfiguration(AiExplanationQueryRateLimitOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<AiExplanationQueryRateLimitOptions>,
+    AiExplanationQueryRateLimitOptionsValidator>();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<AiExplanationQueryAuthenticator>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<AiExplanationQueryRateLimitBoundary>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
 builder.Services.AddHttpClient<

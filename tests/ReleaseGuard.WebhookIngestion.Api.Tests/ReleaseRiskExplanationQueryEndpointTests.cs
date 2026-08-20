@@ -216,6 +216,134 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
     }
 
     [Fact]
+    public async Task Get_RateLimitRunsAfterAuthenticationBeforeRouteAndSharesRotationBudget()
+    {
+        using var application = new TestApplicationFactory(
+            TestApplicationFactory.AiExplanationQueryCredential,
+            TestApplicationFactory.PreviousAiExplanationQueryCredential,
+            rateLimitPermitLimit: 1,
+            rateLimitWindowMilliseconds: 60_000);
+        var eventId = Guid.NewGuid();
+        application.ExplanationQuery.SetSnapshot(
+            eventId,
+            new PendingReleaseRiskExplanationQuerySnapshot(eventId));
+        var eventIdThatMustNotBeQueried = Guid.NewGuid();
+        application.ExplanationQuery.SetHandler(
+            eventIdThatMustNotBeQueried,
+            _ => throw new InvalidOperationException(
+                "Rate-limited requests must not reach the query."));
+        using var client = application.CreateClient();
+
+        using (var unauthorized = await SendAsync(
+                   client,
+                   Route("not-a-guid"),
+                   credential: "wrong-credential"))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
+        }
+
+        using (var active = await SendAsync(
+                   client,
+                   Route(eventId),
+                   TestApplicationFactory.AiExplanationQueryCredential))
+        {
+            Assert.Equal(HttpStatusCode.OK, active.StatusCode);
+        }
+
+        string rateLimitedBody;
+        using (var previous = await SendAsync(
+                   client,
+                   Route(eventId),
+                   TestApplicationFactory.PreviousAiExplanationQueryCredential))
+        {
+            rateLimitedBody = await previous.Content.ReadAsStringAsync();
+            using var body = JsonDocument.Parse(rateLimitedBody);
+
+            Assert.Equal(
+                HttpStatusCode.TooManyRequests,
+                previous.StatusCode);
+            Assert.Equal(
+                ReleaseRiskExplanationQueryEndpoint.RateLimitExceededCode,
+                body.RootElement.GetProperty("code").GetString());
+            Assert.InRange(
+                GetRetryAfterSeconds(previous),
+                1,
+                60);
+        }
+
+        using (var malformed = await SendAsync(
+                   client,
+                   Route("not-a-guid"),
+                   TestApplicationFactory.PreviousAiExplanationQueryCredential))
+        {
+            Assert.Equal(
+                HttpStatusCode.TooManyRequests,
+                malformed.StatusCode);
+            Assert.Equal(
+                rateLimitedBody,
+                await malformed.Content.ReadAsStringAsync());
+        }
+
+        using (var queryBlocked = await SendAsync(
+                   client,
+                   Route(eventIdThatMustNotBeQueried),
+                   TestApplicationFactory.AiExplanationQueryCredential))
+        {
+            Assert.Equal(
+                HttpStatusCode.TooManyRequests,
+                queryBlocked.StatusCode);
+            Assert.Equal(
+                rateLimitedBody,
+                await queryBlocked.Content.ReadAsStringAsync());
+        }
+
+        using var unauthorizedAfterExhaustion = await SendAsync(
+            client,
+            Route(eventId),
+            credential: "wrong-credential");
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            unauthorizedAfterExhaustion.StatusCode);
+    }
+
+    [Fact]
+    public async Task Get_WhenRateLimitWindowResets_AllowsAnotherRequest()
+    {
+        var timeProvider = new ManualTimeProvider();
+        using var application = new TestApplicationFactory(
+            TestApplicationFactory.AiExplanationQueryCredential,
+            rateLimitPermitLimit: 1,
+            rateLimitWindowMilliseconds: 100,
+            rateLimitTimeProvider: timeProvider);
+        var eventId = Guid.NewGuid();
+        application.ExplanationQuery.SetSnapshot(
+            eventId,
+            new PendingReleaseRiskExplanationQuerySnapshot(eventId));
+        using var client = application.CreateClient();
+
+        using var first = await SendAsync(
+            client,
+            Route(eventId),
+            TestApplicationFactory.AiExplanationQueryCredential);
+        using var rejected = await SendAsync(
+            client,
+            Route(eventId),
+            TestApplicationFactory.AiExplanationQueryCredential);
+
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+        Assert.Equal(1, GetRetryAfterSeconds(rejected));
+
+        timeProvider.Advance(TimeSpan.FromMilliseconds(100));
+
+        using var afterReset = await SendAsync(
+            client,
+            Route(eventId),
+            TestApplicationFactory.AiExplanationQueryCredential);
+        Assert.Equal(HttpStatusCode.OK, afterReset.StatusCode);
+    }
+
+    [Fact]
     public async Task Get_WhenReadDeadlineExpires_ReturnsServiceUnavailableAndCancelsRead()
     {
         var eventId = Guid.NewGuid();
@@ -264,11 +392,13 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
         context.Request.Headers.Authorization =
             $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}";
         using var authenticator = CreateAuthenticator();
+        var rateLimitBoundary = CreateRateLimitBoundary();
 
         var handling = ReleaseRiskExplanationQueryEndpoint.HandleAsync(
             context.Request,
             eventId.ToString("D"),
             authenticator,
+            rateLimitBoundary,
             query,
             Options.Create(new AiExplanationQueryOptions()),
             cancellation.Token);
@@ -336,6 +466,32 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
                 ActiveCredential = TestApplicationFactory
                     .AiExplanationQueryCredential
             }));
+
+    private static AiExplanationQueryRateLimitBoundary
+        CreateRateLimitBoundary() =>
+        new(
+            Options.Create(new AiExplanationQueryRateLimitOptions()),
+            TimeProvider.System);
+
+    private static async Task<HttpResponseMessage> SendAsync(
+        HttpClient client,
+        string route,
+        string credential)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, route);
+        request.Headers.TryAddWithoutValidation(
+            AiExplanationQueryAuthenticator.HeaderName,
+            $"Bearer {credential}");
+        return await client.SendAsync(request);
+    }
+
+    private static int GetRetryAfterSeconds(HttpResponseMessage response)
+    {
+        var retryAfter = response.Headers.RetryAfter;
+        Assert.NotNull(retryAfter);
+        Assert.NotNull(retryAfter.Delta);
+        return checked((int)retryAfter.Delta.Value.TotalSeconds);
+    }
 
     private static ReleaseRiskExplanation CreateExplanation(
         Guid eventId,
