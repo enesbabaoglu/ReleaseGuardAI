@@ -47,7 +47,9 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                     "http://127.0.0.1:8090",
                 [$"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds"] =
                     _queryReadTimeoutMilliseconds.ToString(
-                        System.Globalization.CultureInfo.InvariantCulture)
+                        System.Globalization.CultureInfo.InvariantCulture),
+                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:Credential"] =
+                    TestApplicationFactory.AiExplanationQueryCredential
             });
         });
     }

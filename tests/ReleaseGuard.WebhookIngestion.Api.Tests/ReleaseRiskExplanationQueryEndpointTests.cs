@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Options;
 using ReleaseGuard.WebhookIngestion.Api;
 
@@ -26,7 +27,7 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
             eventId,
             new PendingReleaseRiskExplanationQuerySnapshot(eventId));
 
-        using var response = await _client.GetAsync(Route(eventId));
+        using var response = await GetAuthorizedAsync(Route(eventId));
         using var body = await ReadJsonAsync(response);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -49,7 +50,7 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
                 eventId,
                 CreateExplanation(eventId, "durable explanation")));
 
-        using var response = await _client.GetAsync(Route(eventId));
+        using var response = await GetAuthorizedAsync(Route(eventId));
         using var body = await ReadJsonAsync(response);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -84,7 +85,7 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
                     "response_contract_invalid",
                     "AI explanation response violated the required response contract.")));
 
-        using var response = await _client.GetAsync(Route(eventId));
+        using var response = await GetAuthorizedAsync(Route(eventId));
         using var body = await ReadJsonAsync(response);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -110,7 +111,7 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
     public async Task Get_WithMalformedEventId_ReturnsStableBadRequest(
         string eventId)
     {
-        using var response = await _client.GetAsync(Route(eventId));
+        using var response = await GetAuthorizedAsync(Route(eventId));
         using var body = await ReadJsonAsync(response);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
@@ -122,13 +123,67 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
     [Fact]
     public async Task Get_WithUnknownEvent_ReturnsStableNotFound()
     {
-        using var response = await _client.GetAsync(Route(Guid.NewGuid()));
+        using var response = await GetAuthorizedAsync(Route(Guid.NewGuid()));
         using var body = await ReadJsonAsync(response);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal(
             ReleaseRiskExplanationQueryEndpoint.NotFoundCode,
             body.RootElement.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Get_WithAuthenticationFailures_ReturnsIdenticalStableUnauthorizedBeforeQuery()
+    {
+        var eventId = Guid.NewGuid();
+        _query.SetHandler(
+            eventId,
+            _ => throw new InvalidOperationException(
+                "Authentication failures must not reach the query."));
+        var authorizationValues = new string?[][]
+        {
+            [],
+            ["Bearer"],
+            ["Basic malformed-authorization-value"],
+            ["Bearer wrong-credential"],
+            [
+                $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}",
+                $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}"
+            ]
+        };
+        string? expectedBody = null;
+
+        foreach (var values in authorizationValues)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                Route(eventId));
+            if (values.Length > 0)
+            {
+                request.Headers.TryAddWithoutValidation(
+                    AiExplanationQueryAuthenticator.HeaderName,
+                    values);
+            }
+
+            using var response = await _client.SendAsync(request);
+            var bodyText = await response.Content.ReadAsStringAsync();
+            using var body = JsonDocument.Parse(bodyText);
+
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+            Assert.Equal(
+                AiExplanationQueryAuthenticator.Challenge,
+                Assert.Single(response.Headers.WwwAuthenticate).Scheme);
+            Assert.Equal(
+                ReleaseRiskExplanationQueryEndpoint.AuthenticationFailedCode,
+                body.RootElement.GetProperty("code").GetString());
+            Assert.Equal("Authentication failed.",
+                body.RootElement.GetProperty("title").GetString());
+            Assert.Equal("The request could not be authenticated.",
+                body.RootElement.GetProperty("detail").GetString());
+
+            expectedBody ??= bodyText;
+            Assert.Equal(expectedBody, bodyText);
+        }
     }
 
     [Fact]
@@ -153,7 +208,7 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
                 }
             });
 
-        using var response = await _client.GetAsync(Route(eventId));
+        using var response = await GetAuthorizedAsync(Route(eventId));
         using var body = await ReadJsonAsync(response);
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
@@ -176,9 +231,15 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
                 return null;
             });
         using var cancellation = new CancellationTokenSource();
+        var context = new DefaultHttpContext();
+        context.Request.Headers.Authorization =
+            $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}";
+        using var authenticator = CreateAuthenticator();
 
         var handling = ReleaseRiskExplanationQueryEndpoint.HandleAsync(
+            context.Request,
             eventId.ToString("D"),
+            authenticator,
             query,
             Options.Create(new AiExplanationQueryOptions()),
             cancellation.Token);
@@ -229,6 +290,23 @@ public sealed class ReleaseRiskExplanationQueryEndpointTests :
 
     private static string Route(string eventId) =>
         $"/v1/release-risk-events/{eventId}/ai-explanation";
+
+    private async Task<HttpResponseMessage> GetAuthorizedAsync(string route)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, route);
+        request.Headers.TryAddWithoutValidation(
+            AiExplanationQueryAuthenticator.HeaderName,
+            $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}");
+        return await _client.SendAsync(request);
+    }
+
+    private static AiExplanationQueryAuthenticator CreateAuthenticator() =>
+        new(Options.Create(
+            new AiExplanationQueryAuthenticationOptions
+            {
+                Credential = TestApplicationFactory
+                    .AiExplanationQueryCredential
+            }));
 
     private static ReleaseRiskExplanation CreateExplanation(
         Guid eventId,

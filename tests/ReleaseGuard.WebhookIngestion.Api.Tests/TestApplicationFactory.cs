@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -13,6 +14,20 @@ namespace ReleaseGuard.WebhookIngestion.Api.Tests;
 public sealed class TestApplicationFactory : WebApplicationFactory<Program>
 {
     public const string GitHubWebhookSecret = "releaseguard-checkpoint-2-test-secret";
+    public static string AiExplanationQueryCredential { get; } =
+        Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+
+    private readonly string? _aiExplanationQueryCredential;
+
+    public TestApplicationFactory()
+        : this(AiExplanationQueryCredential)
+    {
+    }
+
+    internal TestApplicationFactory(string? aiExplanationQueryCredential)
+    {
+        _aiExplanationQueryCredential = aiExplanationQueryCredential;
+    }
 
     public TestExplanationQuery ExplanationQuery { get; } = new();
 
@@ -38,7 +53,9 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
                 [$"{AiExplanationClientOptions.SectionName}:BaseUrl"] =
                     "http://127.0.0.1:8090",
                 [$"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds"] =
-                    "100"
+                    "100",
+                [$"{AiExplanationQueryAuthenticationOptions.SectionName}:Credential"] =
+                    _aiExplanationQueryCredential
             });
         });
 

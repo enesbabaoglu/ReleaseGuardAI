@@ -10,13 +10,29 @@ public static class ReleaseRiskExplanationQueryEndpoint
     public const string MalformedEventIdCode = "malformed_event_id";
     public const string NotFoundCode = "ai_explanation_not_found";
     public const string QueryTimeoutCode = "ai_explanation_query_timeout";
+    public const string AuthenticationFailedCode =
+        "ai_explanation_authentication_failed";
 
     public static async Task<IResult> HandleAsync(
+        HttpRequest request,
         string eventId,
+        AiExplanationQueryAuthenticator authenticator,
         IReleaseRiskExplanationQuery query,
         IOptions<AiExplanationQueryOptions> options,
         CancellationToken cancellationToken)
     {
+        if (!authenticator.IsAuthorized(
+                request.Headers[AiExplanationQueryAuthenticator.HeaderName]))
+        {
+            request.HttpContext.Response.Headers.WWWAuthenticate =
+                AiExplanationQueryAuthenticator.Challenge;
+            return Problem(
+                StatusCodes.Status401Unauthorized,
+                AuthenticationFailedCode,
+                "Authentication failed.",
+                "The request could not be authenticated.");
+        }
+
         if (!Guid.TryParseExact(eventId, "D", out var parsedEventId))
         {
             return Problem(

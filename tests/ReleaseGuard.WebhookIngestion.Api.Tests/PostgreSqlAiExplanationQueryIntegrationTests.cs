@@ -36,7 +36,8 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
         await AcceptAsync(inboxStore, completedEnvelope, offset: 0);
         await AcceptAsync(inboxStore, failedEnvelope, offset: 1);
 
-        using (var pendingResponse = await client.GetAsync(
+        using (var pendingResponse = await SendAuthorizedAsync(
+                   client,
                    Route(completedEnvelope.EventId)))
         using (var pendingBody = await ReadJsonAsync(pendingResponse))
         {
@@ -86,7 +87,8 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
             failedEnvelope.EventId);
 
         string firstCompletedBody;
-        using (var completedResponse = await client.GetAsync(
+        using (var completedResponse = await SendAuthorizedAsync(
+                   client,
                    Route(completedEnvelope.EventId)))
         {
             firstCompletedBody = await completedResponse.Content.ReadAsStringAsync();
@@ -105,7 +107,8 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
                 returnedExplanation.GetProperty("summary").GetString());
         }
 
-        using (var repeatedCompletedResponse = await client.GetAsync(
+        using (var repeatedCompletedResponse = await SendAuthorizedAsync(
+                   client,
                    Route(completedEnvelope.EventId)))
         {
             Assert.Equal(
@@ -113,7 +116,8 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
                 await repeatedCompletedResponse.Content.ReadAsStringAsync());
         }
 
-        using (var failedResponse = await client.GetAsync(
+        using (var failedResponse = await SendAuthorizedAsync(
+                   client,
                    Route(failedEnvelope.EventId)))
         using (var failedBody = await ReadJsonAsync(failedResponse))
         {
@@ -144,7 +148,9 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
                 connectionString,
                 failedEnvelope.EventId));
 
-        using var notFoundResponse = await client.GetAsync(Route(Guid.NewGuid()));
+        using var notFoundResponse = await SendAuthorizedAsync(
+            client,
+            Route(Guid.NewGuid()));
         Assert.Equal(HttpStatusCode.NotFound, notFoundResponse.StatusCode);
     }
 
@@ -175,7 +181,9 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
             await lockCommand.ExecuteNonQueryAsync();
 
             var stopwatch = Stopwatch.StartNew();
-            using var response = await client.GetAsync(Route(envelope.EventId));
+            using var response = await SendAuthorizedAsync(
+                client,
+                Route(envelope.EventId));
             stopwatch.Stop();
             using var body = await ReadJsonAsync(response);
 
@@ -187,7 +195,9 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
             await transaction.RollbackAsync();
         }
 
-        using var recoveredResponse = await client.GetAsync(Route(envelope.EventId));
+        using var recoveredResponse = await SendAuthorizedAsync(
+            client,
+            Route(envelope.EventId));
         using var recoveredBody = await ReadJsonAsync(recoveredResponse);
         Assert.Equal(HttpStatusCode.OK, recoveredResponse.StatusCode);
         Assert.Equal(
@@ -219,6 +229,67 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
             () => query.ReadAsync(envelope.EventId, cancellation.Token));
 
         await transaction.RollbackAsync();
+    }
+
+    [Fact]
+    public async Task Endpoint_RejectsMissingMalformedDuplicateAndWrongCredentialBeforeServingPostgreSqlState()
+    {
+        var connectionString = await _postgresql.CreateIsolatedDatabaseAsync();
+        using var application = new PostgreSqlTestApplicationFactory(
+            connectionString,
+            applyMigrationsOnStartup: true);
+        using var client = application.CreateClient();
+        using var health = await client.GetAsync("/health");
+        health.EnsureSuccessStatusCode();
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var inboxStore = new PostgreSqlReleaseRiskInboxStore(dataSource);
+        var envelope = CreateEnvelope();
+        await AcceptAsync(inboxStore, envelope, offset: 0);
+        var invalidAuthorizationValues = new string?[][]
+        {
+            [],
+            ["Bearer"],
+            ["Basic malformed-authorization-value"],
+            ["Bearer wrong-credential"],
+            [
+                $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}",
+                $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}"
+            ]
+        };
+        string? expectedUnauthorizedBody = null;
+
+        foreach (var values in invalidAuthorizationValues)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                Route(envelope.EventId));
+            if (values.Length > 0)
+            {
+                request.Headers.TryAddWithoutValidation(
+                    AiExplanationQueryAuthenticator.HeaderName,
+                    values);
+            }
+
+            using var response = await client.SendAsync(request);
+            var body = await response.Content.ReadAsStringAsync();
+
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+            Assert.Equal(
+                AiExplanationQueryAuthenticator.Challenge,
+                Assert.Single(response.Headers.WwwAuthenticate).Scheme);
+            expectedUnauthorizedBody ??= body;
+            Assert.Equal(expectedUnauthorizedBody, body);
+        }
+
+        using var authorizedResponse = await SendAuthorizedAsync(
+            client,
+            Route(envelope.EventId));
+        using var authorizedBody = await ReadJsonAsync(authorizedResponse);
+
+        Assert.Equal(HttpStatusCode.OK, authorizedResponse.StatusCode);
+        Assert.Equal(
+            "pending",
+            authorizedBody.RootElement.GetProperty("status").GetString());
     }
 
     private async Task<string> CreateInitializedDatabaseAsync()
@@ -285,6 +356,17 @@ public sealed class PostgreSqlAiExplanationQueryIntegrationTests
 
     private static string Route(Guid eventId) =>
         $"/v1/release-risk-events/{eventId:D}/ai-explanation";
+
+    private static async Task<HttpResponseMessage> SendAuthorizedAsync(
+        HttpClient client,
+        string route)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, route);
+        request.Headers.TryAddWithoutValidation(
+            AiExplanationQueryAuthenticator.HeaderName,
+            $"Bearer {TestApplicationFactory.AiExplanationQueryCredential}");
+        return await client.SendAsync(request);
+    }
 
     private static async Task<JsonDocument> ReadJsonAsync(
         HttpResponseMessage response)

@@ -112,7 +112,16 @@ builder.Services
         $"{AiExplanationQueryOptions.SectionName}:ReadTimeoutMilliseconds must be between {AiExplanationQueryOptions.MinimumReadTimeoutMilliseconds} and {AiExplanationQueryOptions.MaximumReadTimeoutMilliseconds}.")
     .ValidateOnStart();
 
+builder.Services
+    .AddOptions<AiExplanationQueryAuthenticationOptions>()
+    .BindConfiguration(AiExplanationQueryAuthenticationOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<AiExplanationQueryAuthenticationOptions>,
+    AiExplanationQueryAuthenticationOptionsValidator>();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
+builder.Services.AddSingleton<AiExplanationQueryAuthenticator>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
 builder.Services.AddHttpClient<
