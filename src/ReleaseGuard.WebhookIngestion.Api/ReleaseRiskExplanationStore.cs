@@ -9,7 +9,9 @@ public sealed record ReleaseRiskExplanationClaim(
     Guid EventId,
     string ClaimOwner,
     int AttemptCount,
-    ReleaseRiskOutboxEnvelope Envelope);
+    ReleaseRiskOutboxEnvelope Envelope,
+    Guid? ReplayId = null,
+    int Generation = 0);
 
 public sealed record ReleaseRiskExplanationTerminalFailure(
     string Code,
@@ -120,6 +122,63 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             inbox.envelope::text;
         """;
 
+    private const string TerminalizeExhaustedReplaySql = """
+        WITH candidates AS (
+            SELECT replay_id
+            FROM release_risk_ai_explanation_replays
+            WHERE completed_at IS NULL
+              AND failed_at IS NULL
+              AND attempt_count >= @maximum_attempts
+              AND next_attempt_at <= clock_timestamp()
+              AND (
+                  claimed_by IS NULL
+                  OR claim_expires_at <= clock_timestamp())
+            ORDER BY next_attempt_at, requested_at, replay_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT @batch_size
+        )
+        UPDATE release_risk_ai_explanation_replays AS replay
+        SET
+            failed_at = clock_timestamp(),
+            failure_code = @failure_code,
+            failure_reason = @failure_reason,
+            claimed_by = NULL,
+            claim_expires_at = NULL
+        FROM candidates
+        WHERE replay.replay_id = candidates.replay_id;
+        """;
+
+    private const string ClaimPendingReplaySql = """
+        WITH candidates AS (
+            SELECT replay_id
+            FROM release_risk_ai_explanation_replays
+            WHERE completed_at IS NULL
+              AND failed_at IS NULL
+              AND attempt_count < @maximum_attempts
+              AND next_attempt_at <= clock_timestamp()
+              AND (
+                  claimed_by IS NULL
+                  OR claim_expires_at <= clock_timestamp())
+            ORDER BY next_attempt_at, requested_at, replay_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT @batch_size
+        )
+        UPDATE release_risk_ai_explanation_replays AS replay
+        SET
+            claimed_by = @claim_owner,
+            claim_expires_at = clock_timestamp() + @lease_duration,
+            attempt_count = replay.attempt_count + 1
+        FROM candidates
+        WHERE replay.replay_id = candidates.replay_id
+        RETURNING
+            replay.event_id,
+            replay.claimed_by,
+            replay.attempt_count,
+            replay.envelope::text,
+            replay.replay_id,
+            replay.generation;
+        """;
+
     private const string MarkCompletedSql = """
         UPDATE release_risk_event_inbox
         SET
@@ -195,6 +254,89 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         RETURNING event_id;
         """;
 
+    private const string MarkReplayCompletedSql = """
+        UPDATE release_risk_ai_explanation_replays
+        SET
+            completed_at = clock_timestamp(),
+            explanation = @explanation,
+            claimed_by = NULL,
+            claim_expires_at = NULL
+        WHERE replay_id = @replay_id
+          AND event_id = @event_id
+          AND generation = @generation
+          AND completed_at IS NULL
+          AND failed_at IS NULL
+          AND claimed_by = @claim_owner
+          AND attempt_count = @attempt_count
+          AND claim_expires_at > clock_timestamp()
+        RETURNING replay_id;
+        """;
+
+    private const string MarkReplayFailedSql = """
+        UPDATE release_risk_ai_explanation_replays
+        SET
+            next_attempt_at = clock_timestamp() + @retry_delay,
+            claimed_by = NULL,
+            claim_expires_at = NULL
+        WHERE replay_id = @replay_id
+          AND event_id = @event_id
+          AND generation = @generation
+          AND completed_at IS NULL
+          AND failed_at IS NULL
+          AND claimed_by = @claim_owner
+          AND attempt_count = @attempt_count
+          AND claim_expires_at > clock_timestamp()
+        RETURNING replay_id;
+        """;
+
+    private const string MarkReplayTerminalSql = """
+        WITH applied AS (
+            UPDATE release_risk_ai_explanation_replays
+            SET
+                failed_at = clock_timestamp(),
+                failure_code = @failure_code,
+                failure_reason = @failure_reason,
+                claimed_by = NULL,
+                claim_expires_at = NULL
+            WHERE replay_id = @replay_id
+              AND event_id = @event_id
+              AND generation = @generation
+              AND completed_at IS NULL
+              AND failed_at IS NULL
+              AND claimed_by = @claim_owner
+              AND attempt_count = @attempt_count
+              AND claim_expires_at > clock_timestamp()
+            RETURNING replay_id
+        )
+        SELECT EXISTS(SELECT 1 FROM applied)
+            OR EXISTS(
+                SELECT 1
+                FROM release_risk_ai_explanation_replays
+                WHERE replay_id = @replay_id
+                  AND event_id = @event_id
+                  AND generation = @generation
+                  AND completed_at IS NULL
+                  AND failed_at IS NOT NULL
+                  AND failure_code = @failure_code
+                  AND failure_reason = @failure_reason);
+        """;
+
+    private const string ReleaseReplayClaimSql = """
+        UPDATE release_risk_ai_explanation_replays
+        SET
+            next_attempt_at = LEAST(next_attempt_at, clock_timestamp()),
+            claimed_by = NULL,
+            claim_expires_at = NULL
+        WHERE replay_id = @replay_id
+          AND event_id = @event_id
+          AND generation = @generation
+          AND completed_at IS NULL
+          AND failed_at IS NULL
+          AND claimed_by = @claim_owner
+          AND attempt_count = @attempt_count
+        RETURNING replay_id;
+        """;
+
     private const string ReadFailedWorkSql = """
         SELECT
             event_id,
@@ -233,6 +375,31 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(
             cancellationToken);
+        var claims = new List<ReleaseRiskExplanationClaim>();
+
+        await TerminalizeExhaustedReplayAsync(
+            connection,
+            transaction,
+            batchSize,
+            maximumAttempts,
+            cancellationToken);
+        await ClaimPendingReplayAsync(
+            connection,
+            transaction,
+            claimOwner,
+            batchSize,
+            leaseDuration,
+            maximumAttempts,
+            claims,
+            cancellationToken);
+
+        var remainingBatchSize = batchSize - claims.Count;
+        if (remainingBatchSize == 0)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return claims;
+        }
+
         await using (var exhaustedCommand = new NpgsqlCommand(
                          TerminalizeExhaustedSql,
                          connection,
@@ -245,7 +412,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             exhaustedCommand.Parameters.AddWithValue(
                 "batch_size",
                 NpgsqlDbType.Integer,
-                batchSize);
+                remainingBatchSize);
             exhaustedCommand.Parameters.AddWithValue(
                 "failure_code",
                 NpgsqlDbType.Text,
@@ -268,7 +435,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         command.Parameters.AddWithValue(
             "batch_size",
             NpgsqlDbType.Integer,
-            batchSize);
+            remainingBatchSize);
         command.Parameters.AddWithValue(
             "lease_duration",
             NpgsqlDbType.Interval,
@@ -280,8 +447,6 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
 
         await using var reader = await command.ExecuteReaderAsync(
             cancellationToken);
-        var claims = new List<ReleaseRiskExplanationClaim>();
-
         while (await reader.ReadAsync(cancellationToken))
         {
             var claim = new ReleaseRiskExplanationClaim(
@@ -316,6 +481,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
 
         return ExecuteClaimUpdateAsync(
             MarkCompletedSql,
+            MarkReplayCompletedSql,
             claim,
             explanation,
             retryDelay: null,
@@ -337,6 +503,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
 
         return ExecuteClaimUpdateAsync(
             MarkFailedSql,
+            MarkReplayFailedSql,
             claim,
             explanation: null,
             retryDelay,
@@ -354,6 +521,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
 
         return ExecuteClaimUpdateAsync(
             MarkTerminalSql,
+            MarkReplayTerminalSql,
             claim,
             explanation: null,
             retryDelay: null,
@@ -368,6 +536,7 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         ValidateClaim(claim);
         return ExecuteClaimUpdateAsync(
             ReleaseClaimSql,
+            ReleaseReplayClaimSql,
             claim,
             explanation: null,
             retryDelay: null,
@@ -408,13 +577,15 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
 
     private async Task<bool> ExecuteClaimUpdateAsync(
         string sql,
+        string replaySql,
         ReleaseRiskExplanationClaim claim,
         ReleaseRiskExplanation? explanation,
         TimeSpan? retryDelay,
         ReleaseRiskExplanationTerminalFailure? failure,
         CancellationToken cancellationToken)
     {
-        await using var command = _dataSource.CreateCommand(sql);
+        await using var command = _dataSource.CreateCommand(
+            claim.ReplayId is null ? sql : replaySql);
         command.Parameters.AddWithValue("event_id", claim.EventId);
         command.Parameters.AddWithValue(
             "claim_owner",
@@ -424,6 +595,15 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             "attempt_count",
             NpgsqlDbType.Integer,
             claim.AttemptCount);
+
+        if (claim.ReplayId is not null)
+        {
+            command.Parameters.AddWithValue("replay_id", claim.ReplayId.Value);
+            command.Parameters.AddWithValue(
+                "generation",
+                NpgsqlDbType.Integer,
+                claim.Generation);
+        }
 
         if (explanation is not null)
         {
@@ -493,6 +673,82 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
         }
     }
 
+    private static async Task TerminalizeExhaustedReplayAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        int batchSize,
+        int maximumAttempts,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(
+            TerminalizeExhaustedReplaySql,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue(
+            "maximum_attempts",
+            NpgsqlDbType.Integer,
+            maximumAttempts);
+        command.Parameters.AddWithValue(
+            "batch_size",
+            NpgsqlDbType.Integer,
+            batchSize);
+        command.Parameters.AddWithValue(
+            "failure_code",
+            NpgsqlDbType.Text,
+            AiExplanationFailureClassifier.AttemptLimitExhaustedCode);
+        command.Parameters.AddWithValue(
+            "failure_reason",
+            NpgsqlDbType.Text,
+            "Configured maximum attempt count was reached before a replay result was persisted.");
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task ClaimPendingReplayAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string claimOwner,
+        int batchSize,
+        TimeSpan leaseDuration,
+        int maximumAttempts,
+        List<ReleaseRiskExplanationClaim> claims,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(
+            ClaimPendingReplaySql,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue(
+            "claim_owner",
+            NpgsqlDbType.Text,
+            claimOwner);
+        command.Parameters.AddWithValue(
+            "batch_size",
+            NpgsqlDbType.Integer,
+            batchSize);
+        command.Parameters.AddWithValue(
+            "lease_duration",
+            NpgsqlDbType.Interval,
+            leaseDuration);
+        command.Parameters.AddWithValue(
+            "maximum_attempts",
+            NpgsqlDbType.Integer,
+            maximumAttempts);
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var claim = new ReleaseRiskExplanationClaim(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                reader.GetInt32(2),
+                ReleaseRiskOutboxEnvelope.Deserialize(reader.GetString(3)),
+                reader.GetGuid(4),
+                reader.GetInt32(5));
+            ValidateClaim(claim);
+            claims.Add(claim);
+        }
+    }
+
     private static void ValidateTerminalFailure(
         ReleaseRiskExplanationTerminalFailure failure)
     {
@@ -523,7 +779,9 @@ public sealed class PostgreSqlReleaseRiskExplanationStore :
             claim.AttemptCount < 1 ||
             claim.Envelope is null ||
             claim.EventId != claim.Envelope.EventId ||
-            !claim.Envelope.IsValidVersionOneContract())
+            !claim.Envelope.IsValidVersionOneContract() ||
+            (claim.ReplayId is null && claim.Generation != 0) ||
+            (claim.ReplayId is not null && claim.Generation < 1))
         {
             throw new ArgumentException(
                 "The explanation claim must contain a valid owner, attempt and matching V1 event snapshot.",

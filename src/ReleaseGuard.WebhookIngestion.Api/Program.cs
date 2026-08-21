@@ -7,6 +7,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddMetrics();
 
 builder.Services
+    .AddOptions<AiExplanationMetricsExportOptions>()
+    .BindConfiguration(AiExplanationMetricsExportOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<AiExplanationMetricsExportOptions>,
+    AiExplanationMetricsExportOptionsValidator>();
+
+builder.Services
     .AddOptions<GitHubWebhookOptions>()
     .BindConfiguration(GitHubWebhookOptions.SectionName)
     .Validate(
@@ -130,10 +138,36 @@ builder.Services.AddSingleton<
     IValidateOptions<AiExplanationQueryRateLimitOptions>,
     AiExplanationQueryRateLimitOptionsValidator>();
 
+builder.Services
+    .AddOptions<AiExplanationReplayOptions>()
+    .BindConfiguration(AiExplanationReplayOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<AiExplanationReplayOptions>,
+    AiExplanationReplayOptionsValidator>();
+
+builder.Services
+    .AddOptions<AiExplanationReplayAuthenticationOptions>()
+    .BindConfiguration(AiExplanationReplayAuthenticationOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<AiExplanationReplayAuthenticationOptions>,
+    AiExplanationReplayAuthenticationOptionsValidator>();
+
+builder.Services
+    .AddOptions<RetentionCleanupOptions>()
+    .BindConfiguration(RetentionCleanupOptions.SectionName)
+    .ValidateOnStart();
+builder.Services.AddSingleton<
+    IValidateOptions<RetentionCleanupOptions>,
+    RetentionCleanupOptionsValidator>();
+
 builder.Services.AddSingleton<GitHubWebhookSignatureValidator>();
 builder.Services.AddSingleton<AiExplanationQueryAuthenticator>();
+builder.Services.AddSingleton<AiExplanationReplayAuthenticator>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<AiExplanationQueryRateLimitBoundary>();
+builder.Services.AddSingleton<AiExplanationReplayRateLimitBoundary>();
 builder.Services.AddSingleton<IAiExplanationQueryMetrics, AiExplanationQueryMetrics>();
 builder.Services.AddSingleton<GitHubRiskInputMapper>();
 builder.Services.AddSingleton<ReleaseRiskEvaluator>();
@@ -171,7 +205,17 @@ builder.Services.AddSingleton<
 builder.Services.AddSingleton<
     IReleaseRiskExplanationQuery,
     PostgreSqlReleaseRiskExplanationQuery>();
+builder.Services.AddSingleton<
+    IReleaseRiskExplanationCollectionQuery,
+    PostgreSqlReleaseRiskExplanationCollectionQuery>();
+builder.Services.AddSingleton<
+    IReleaseRiskExplanationReplayStore,
+    PostgreSqlReleaseRiskExplanationReplayStore>();
+builder.Services.AddSingleton<
+    IReleaseGuardRetentionStore,
+    PostgreSqlReleaseGuardRetentionStore>();
 builder.Services.AddHostedService<PostgreSqlSchemaInitializer>();
+builder.Services.AddHostedService<AiExplanationMetricsExporter>();
 builder.Services.AddHostedService<ReleaseRiskOutboxDispatcher>();
 builder.Services.AddSingleton<ReleaseRiskInboxProcessor>(serviceProvider =>
     new ReleaseRiskInboxProcessor(
@@ -184,6 +228,7 @@ builder.Services.AddSingleton<ReleaseRiskInboxProcessor>(serviceProvider =>
 builder.Services.AddHostedService(serviceProvider =>
     serviceProvider.GetRequiredService<ReleaseRiskInboxProcessor>());
 builder.Services.AddHostedService<ReleaseRiskExplanationProcessor>();
+builder.Services.AddHostedService<ReleaseGuardRetentionCleanup>();
 
 var app = builder.Build();
 
@@ -192,6 +237,15 @@ app.MapPost(GitHubWebhookEndpoint.Route, GitHubWebhookEndpoint.HandleAsync);
 app.MapGet(
     ReleaseRiskExplanationQueryEndpoint.Route,
     ReleaseRiskExplanationQueryEndpoint.HandleAsync);
+app.MapGet(
+    ReleaseRiskExplanationListEndpoint.Route,
+    ReleaseRiskExplanationListEndpoint.HandleAsync);
+app.MapGet(
+    LatestAcceptedReleaseRiskExplanationEndpoint.Route,
+    LatestAcceptedReleaseRiskExplanationEndpoint.HandleAsync);
+app.MapPost(
+    ReleaseRiskExplanationReplayEndpoint.Route,
+    ReleaseRiskExplanationReplayEndpoint.HandleAsync);
 
 app.Run();
 

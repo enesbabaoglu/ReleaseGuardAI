@@ -1,0 +1,143 @@
+name: releaseguard-local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: releaseguard
+      POSTGRES_USER: releaseguard
+      POSTGRES_PASSWORD: ${RELEASEGUARD_POSTGRES_PASSWORD:?Set RELEASEGUARD_POSTGRES_PASSWORD}
+    ports:
+      - "${RELEASEGUARD_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - releaseguard-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U releaseguard -d releaseguard"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+    ports:
+      - "${RELEASEGUARD_KAFKA_PORT:-19092}:19092"
+    volumes:
+      - releaseguard-redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "-X", "brokers=localhost:9092"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        rpk topic create releaseguard.release-risk-assessed
+        --brokers redpanda:9092
+        --partitions 1
+        --replicas 1
+        || rpk topic describe releaseguard.release-risk-assessed
+        --brokers redpanda:9092
+    restart: "no"
+
+  ai-explanation:
+    build:
+      context: .
+      dockerfile: src/ReleaseGuard.AiExplanation.Api/Dockerfile
+    environment:
+      RELEASEGUARD_AI_PROVIDER: fake
+      RELEASEGUARD_AI_MODEL: deterministic-local
+      RELEASEGUARD_AI_TIMEOUT_SECONDS: "5"
+    ports:
+      - "${RELEASEGUARD_AI_PORT:-8090}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.153.0
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./deploy/local/otel-collector-config.yml:/etc/otelcol/config.yml:ro
+    restart: unless-stopped
+
+  webhook-api:
+    build:
+      context: .
+      dockerfile: src/ReleaseGuard.WebhookIngestion.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      PostgreSql__ConnectionString: >-
+        Host=postgres;Port=5432;Database=releaseguard;Username=releaseguard;Password=${RELEASEGUARD_POSTGRES_PASSWORD};Include Error Detail=false
+      PostgreSql__ApplyMigrationsOnStartup: "true"
+      GitHubWebhook__Secret: ${RELEASEGUARD_GITHUB_WEBHOOK_SECRET:?Set RELEASEGUARD_GITHUB_WEBHOOK_SECRET}
+      Kafka__BootstrapServers: redpanda:9092
+      Kafka__Topic: releaseguard.release-risk-assessed
+      Kafka__ClientId: releaseguard-local-producer
+      KafkaConsumer__BootstrapServers: redpanda:9092
+      KafkaConsumer__Topic: releaseguard.release-risk-assessed
+      KafkaConsumer__GroupId: releaseguard-local-inbox
+      KafkaConsumer__ClientId: releaseguard-local-consumer
+      OutboxDispatcher__Enabled: "true"
+      InboxProcessor__Enabled: "true"
+      AiExplanationClient__BaseUrl: http://ai-explanation:8080
+      AiExplanationProcessor__Enabled: "true"
+      AiExplanationQueryAuthentication__ActiveCredential: ${RELEASEGUARD_QUERY_CREDENTIAL:?Set RELEASEGUARD_QUERY_CREDENTIAL}
+      AiExplanationQueryRateLimit__PermitLimit: "60"
+      AiExplanationQueryRateLimit__WindowMilliseconds: "60000"
+      AiExplanationReplayAuthentication__ActiveCredential: ${RELEASEGUARD_REPLAY_CREDENTIAL:?Set RELEASEGUARD_REPLAY_CREDENTIAL}
+      AiExplanationReplay__PermitLimit: "10"
+      AiExplanationReplay__WindowMilliseconds: "60000"
+      RetentionCleanup__Enabled: "true"
+      AiExplanationMetricsExport__Enabled: "true"
+      AiExplanationMetricsExport__Endpoint: http://otel-collector:4317
+      AiExplanationMetricsExport__Protocol: grpc
+      AiExplanationMetricsExport__ExportIntervalMilliseconds: "10000"
+      AiExplanationMetricsExport__ExportTimeoutMilliseconds: "5000"
+    ports:
+      - "${RELEASEGUARD_API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      ai-explanation:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+
+volumes:
+  releaseguard-postgres:
+  releaseguard-redpanda:

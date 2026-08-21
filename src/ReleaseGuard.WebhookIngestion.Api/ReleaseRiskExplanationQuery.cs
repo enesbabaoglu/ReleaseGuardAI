@@ -42,18 +42,43 @@ public sealed class PostgreSqlReleaseRiskExplanationQuery :
 {
     private const string ReadSql = """
         SELECT
-            event_id,
-            explanation_completed_at,
-            explanation::text,
-            explanation_failed_at,
-            explanation_failure_code,
-            explanation_failure_reason
-        FROM release_risk_event_inbox
-        WHERE event_id = @event_id;
+            inbox.event_id,
+            CASE WHEN replay.replay_id IS NULL
+                THEN inbox.explanation_completed_at
+                ELSE replay.completed_at
+            END,
+            CASE WHEN replay.replay_id IS NULL
+                THEN inbox.explanation::text
+                ELSE replay.explanation::text
+            END,
+            CASE WHEN replay.replay_id IS NULL
+                THEN inbox.explanation_failed_at
+                ELSE replay.failed_at
+            END,
+            CASE WHEN replay.replay_id IS NULL
+                THEN inbox.explanation_failure_code
+                ELSE replay.failure_code
+            END,
+            CASE WHEN replay.replay_id IS NULL
+                THEN inbox.explanation_failure_reason
+                ELSE replay.failure_reason
+            END
+        FROM release_risk_event_inbox AS inbox
+        LEFT JOIN LATERAL (
+            SELECT
+                replay_id,
+                completed_at,
+                explanation,
+                failed_at,
+                failure_code,
+                failure_reason
+            FROM release_risk_ai_explanation_replays
+            WHERE event_id = inbox.event_id
+            ORDER BY generation DESC
+            LIMIT 1
+        ) AS replay ON TRUE
+        WHERE inbox.event_id = @event_id;
         """;
-
-    private static readonly JsonSerializerOptions JsonOptions =
-        new(JsonSerializerDefaults.Web);
 
     private readonly NpgsqlDataSource _dataSource;
 
@@ -78,13 +103,27 @@ public sealed class PostgreSqlReleaseRiskExplanationQuery :
             return null;
         }
 
-        var storedEventId = reader.GetGuid(0);
-        if (storedEventId != eventId)
+        var snapshot = ReleaseRiskExplanationQuerySnapshotReader.Read(reader);
+        if (snapshot.EventId != eventId)
         {
             throw new InvalidOperationException(
-                $"AI explanation query returned event '{storedEventId:D}' for requested event '{eventId:D}'.");
+                $"AI explanation query returned event '{snapshot.EventId:D}' for requested event '{eventId:D}'.");
         }
 
+        return snapshot;
+    }
+}
+
+internal static class ReleaseRiskExplanationQuerySnapshotReader
+{
+    private static readonly JsonSerializerOptions JsonOptions =
+        new(JsonSerializerDefaults.Web);
+
+    public static ReleaseRiskExplanationQuerySnapshot Read(
+        NpgsqlDataReader reader)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        var storedEventId = reader.GetGuid(0);
         var completed = !reader.IsDBNull(1);
         var explanationJson = reader.IsDBNull(2) ? null : reader.GetString(2);
         var failed = !reader.IsDBNull(3);
@@ -128,7 +167,7 @@ public sealed class PostgreSqlReleaseRiskExplanationQuery :
         }
 
         throw new InvalidOperationException(
-            $"AI explanation state for event '{eventId:D}' is inconsistent.");
+            $"AI explanation state for event '{storedEventId:D}' is inconsistent.");
     }
 
     private static ReleaseRiskExplanation DeserializeExplanation(

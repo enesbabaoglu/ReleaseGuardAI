@@ -564,7 +564,7 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         Assert.Null(state.CompletedAt);
         Assert.Null(state.Explanation);
         Assert.Equal(
-            new[] { 1, 2, 3, 4, 5, 6 },
+            new[] { 1, 2, 3, 4, 5, 6, 7, 8 },
             await ReadMigrationVersionsAsync(connectionString));
 
         await using var dataSource = NpgsqlDataSource.Create(connectionString);
@@ -603,7 +603,7 @@ public sealed class PostgreSqlAiExplanationProcessorIntegrationTests
         Assert.Null(state.FailureCode);
         Assert.Null(state.FailureReason);
         Assert.Equal(
-            new[] { 1, 2, 3, 4, 5, 6 },
+            new[] { 1, 2, 3, 4, 5, 6, 7, 8 },
             await ReadMigrationVersionsAsync(connectionString));
     }
 

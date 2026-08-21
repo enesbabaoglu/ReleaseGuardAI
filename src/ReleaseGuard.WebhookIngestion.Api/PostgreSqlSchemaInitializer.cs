@@ -6,7 +6,7 @@ namespace ReleaseGuard.WebhookIngestion.Api;
 
 public sealed class PostgreSqlSchemaInitializer : IHostedService
 {
-    private const int LatestSchemaVersion = 6;
+    private const int LatestSchemaVersion = 8;
     private const long MigrationLockKey = 7_142_033_117_501_001;
 
     private static readonly Migration[] Migrations =
@@ -34,7 +34,15 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
         new(
             6,
             "add release risk AI explanation terminal lifecycle",
-            "ReleaseGuard.Database.Migrations.V006.sql")
+            "ReleaseGuard.Database.Migrations.V006.sql"),
+        new(
+            7,
+            "add release risk AI explanation replay lifecycle",
+            "ReleaseGuard.Database.Migrations.V007.sql"),
+        new(
+            8,
+            "add bounded retention cleanup indexes",
+            "ReleaseGuard.Database.Migrations.V008.sql")
     ];
 
     private const string CreateMigrationTableSql = """
@@ -94,6 +102,42 @@ public sealed class PostgreSqlSchemaInitializer : IHostedService
             accepted_at,
             envelope
         FROM release_risk_ai_explanation_failed_work
+        LIMIT 0;
+
+        SELECT
+            replay_id,
+            event_id,
+            generation,
+            requested_at,
+            prior_failed_at,
+            prior_failure_code,
+            prior_failure_reason,
+            attempt_count,
+            next_attempt_at,
+            claimed_by,
+            claim_expires_at,
+            completed_at,
+            explanation,
+            failed_at,
+            failure_code,
+            failure_reason
+        FROM release_risk_ai_explanation_replays
+        LIMIT 0;
+
+        SELECT
+            replay_id,
+            event_id,
+            generation,
+            requested_at,
+            prior_failed_at,
+            prior_failure_code,
+            prior_failure_reason,
+            attempt_count,
+            completed_at,
+            failed_at,
+            failure_code,
+            failure_reason
+        FROM release_risk_ai_explanation_replay_history
         LIMIT 0;
         """;
 

@@ -76,7 +76,9 @@ public sealed class PostgreSqlTestApplicationFactory : WebApplicationFactory<Pro
                         System.Globalization.CultureInfo.InvariantCulture),
                 [$"{AiExplanationQueryRateLimitOptions.SectionName}:WindowMilliseconds"] =
                     _rateLimitWindowMilliseconds.ToString(
-                        System.Globalization.CultureInfo.InvariantCulture)
+                        System.Globalization.CultureInfo.InvariantCulture),
+                [$"{AiExplanationReplayAuthenticationOptions.SectionName}:ActiveCredential"] =
+                    TestApplicationFactory.AiExplanationReplayCredential
             });
         });
 

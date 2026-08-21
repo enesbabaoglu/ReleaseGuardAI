@@ -5,6 +5,7 @@
   <ItemGroup>
     <PackageReference Include="Confluent.Kafka" Version="2.15.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.17.0" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Database/Migrations/V001__create_github_webhook_deliveries.sql"
@@ -19,5 +20,9 @@
                       LogicalName="ReleaseGuard.Database.Migrations.V005.sql" />
     <EmbeddedResource Include="Database/Migrations/V006__add_release_risk_ai_explanation_terminal_lifecycle.sql"
                       LogicalName="ReleaseGuard.Database.Migrations.V006.sql" />
+    <EmbeddedResource Include="Database/Migrations/V007__add_ai_explanation_replay_lifecycle.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V007.sql" />
+    <EmbeddedResource Include="Database/Migrations/V008__add_retention_cleanup_indexes.sql"
+                      LogicalName="ReleaseGuard.Database.Migrations.V008.sql" />
   </ItemGroup>
 </Project>
