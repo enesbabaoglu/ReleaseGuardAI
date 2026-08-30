@@ -12,6 +12,8 @@ from releaseguard_ai.providers import (
     ExplanationProviderError,
     ExplanationProviderTimeoutError,
     HttpJsonExplanationProvider,
+    OllamaExplanationProvider,
+    create_provider,
 )
 from releaseguard_ai.settings import AiExplanationSettings
 
@@ -23,6 +25,16 @@ def http_settings(timeout_seconds: float = 1) -> AiExplanationSettings:
         timeout_seconds=timeout_seconds,
         provider_endpoint="https://models.example/v1/explain",
         provider_api_key="environment-secret",
+    )
+
+
+def ollama_settings(timeout_seconds: float = 1) -> AiExplanationSettings:
+    return AiExplanationSettings(
+        provider="ollama",
+        model="qwen3:1.7b",
+        timeout_seconds=timeout_seconds,
+        provider_endpoint="http://ollama:11434/api/chat",
+        output_language="tr",
     )
 
 
@@ -154,6 +166,128 @@ async def test_http_provider_does_not_swallow_cancellation() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_uses_structured_non_streaming_chat_contract(
+    v1_payload: dict[str, Any],
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        captured["request"] = httpx.Response(200, content=request.read()).json()
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen3:1.7b",
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        '{"summary":"Kayıtlı risk seviyesi düşüktür.",'
+                        '"recommendations":["Ana dal değişikliğini inceleyin."]}'
+                    ),
+                },
+                "done": True,
+            },
+        )
+
+    provider = OllamaExplanationProvider(
+        ollama_settings(),
+        httpx.MockTransport(handler),
+    )
+    envelope = ReleaseRiskAssessedV1.model_validate(v1_payload)
+
+    explanation = await provider.explain(envelope)
+
+    request_json = captured["request"]
+    assert "Authorization" not in captured["headers"]
+    assert request_json["model"] == "qwen3:1.7b"
+    assert request_json["stream"] is False
+    assert request_json["think"] is False
+    assert request_json["keep_alive"] == "5m"
+    assert request_json["options"] == {"temperature": 0.2, "num_predict": 512}
+    assert request_json["format"]["type"] == "object"
+    assert set(request_json["format"]["required"]) == {
+        "summary",
+        "recommendations",
+    }
+    assert "Türkçe" in request_json["messages"][0]["content"]
+    assert "skorun n/100" in request_json["messages"][0]["content"]
+    assert str(envelope.eventId) in request_json["messages"][1]["content"]
+    assert "20/100" in request_json["messages"][1]["content"]
+    assert "'low'" in request_json["messages"][1]["content"]
+    assert explanation.summary == "Kayıtlı risk seviyesi düşüktür."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={"message": {"content": "not-json"}}),
+        httpx.Response(200, json={"message": {"content": "{}"}}),
+        httpx.Response(200, json={"message": {"content": {}}}),
+        httpx.Response(200, json={"done": True}),
+    ],
+)
+async def test_ollama_provider_rejects_invalid_contract(
+    response: httpx.Response,
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response
+
+    provider = OllamaExplanationProvider(
+        ollama_settings(),
+        httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ExplanationProviderError):
+        await provider.explain(_minimal_envelope())
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_maps_timeout_without_leaking_details() -> None:
+    async def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("sensitive local path", request=request)
+
+    provider = OllamaExplanationProvider(
+        ollama_settings(),
+        httpx.MockTransport(timeout_handler),
+    )
+
+    with pytest.raises(ExplanationProviderTimeoutError) as error:
+        await provider.explain(_minimal_envelope())
+
+    assert "sensitive" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_does_not_swallow_cancellation() -> None:
+    started = asyncio.Event()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    provider = OllamaExplanationProvider(
+        ollama_settings(),
+        httpx.MockTransport(handler),
+    )
+    task = asyncio.create_task(provider.explain(_minimal_envelope()))
+    await started.wait()
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_provider_factory_creates_ollama_boundary() -> None:
+    assert isinstance(
+        create_provider(ollama_settings()),
+        OllamaExplanationProvider,
+    )
 
 
 def _minimal_envelope() -> ReleaseRiskAssessedV1:

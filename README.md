@@ -2,7 +2,7 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarını PostgreSQL'e atomik olarak kabul eder, sürümlü outbox envelope'unu Kafka'ya at-least-once yayımlar, record'u durable inbox'a idempotent biçimde alır ve ayrı Python servisiyle bounded AI açıklaması üretir. Yetkili servisler tek event sonucunu, bounded keyset sayfalarını ve repository/change için açıkça `latestAccepted` olarak adlandırılmış snapshot'ı okuyabilir. Terminal başarısızlıklar ayrı credential, global bütçe ve `Idempotency-Key` ile yeni, değişmez replay generation'larına alınabilir; V006'daki özgün success/terminal sonuçları yerinde değiştirilmez. Düşük kardinaliteli query metrikleri opt-in OTLP ile collector'a aktarılabilir; bounded retention işi yalnız güvenle sonlandırılmış taşıma kayıtlarını temizler. Checked-in Docker Compose PostgreSQL, Redpanda, topic hazırlığı, iki uygulama ve OpenTelemetry Collector'dan oluşan tam yerel akışı çalıştırır. Dashboard ve production dağıtım/hardening bu backend tamamlamasının bilinçli olarak dışındadır.
+Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarını PostgreSQL'e atomik olarak kabul eder, sürümlü outbox envelope'unu Kafka'ya at-least-once yayımlar, record'u durable inbox'a idempotent biçimde alır ve ayrı Python servisiyle bounded AI açıklaması üretir. Yetkili servisler tek event sonucunu, bounded keyset sayfalarını ve repository/change için açıkça `latestAccepted` olarak adlandırılmış snapshot'ı okuyabilir. Terminal başarısızlıklar ayrı credential, global bütçe ve `Idempotency-Key` ile yeni, değişmez replay generation'larına alınabilir; V006'daki özgün success/terminal sonuçları yerinde değiştirilmez. Düşük kardinaliteli query metrikleri opt-in OTLP ile collector'a aktarılabilir; bounded retention işi yalnız güvenle sonlandırılmış taşıma kayıtlarını temizler. Yerel operator dashboard'u bu mevcut read/replay sözleşmelerini server-side BFF üzerinden tüketir; browser'a service credential göndermez. Checked-in Docker Compose PostgreSQL, Redpanda, Ollama, ücretsiz `qwen3:1.7b` modeli, Python AI API, .NET API/worker, dashboard ve OpenTelemetry Collector'dan oluşan tam yerel akışı çalıştırır. Production dağıtım/hardening bilinçli olarak ayrı fazdır.
 
 ## Bu adımda ne yapıyoruz?
 
@@ -10,12 +10,14 @@ Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarını PostgreSQL'
 - `GET /v1/release-risk-events/ai-explanations` ile opaque cursor'lı, `accepted_at DESC, event_id DESC` keyset sayfalama; repository/change route'unda ise anlamı response'ta da görünen `latestAccepted` seçimi sunuyoruz. İki route mevcut query active/previous authentication'ını ve aynı global read bütçesini paylaşır.
 - `POST /v1/release-risk-events/{eventId}/ai-explanation/replays` ile yalnız son effective generation terminal failed ise idempotent replay oluşturuyoruz. Replay query credential'ından ayrı rotate edilebilir credential ve ayrı global per-instance limiter kullanır; özgün inbox sonucu mutate edilmez.
 - V008 indeksleriyle çalışan opt-in retention worker yalnız yayımlanmış outbox, kalıcı inbox karşılığı bulunan eski accepted delivery ve eski ignored delivery receipt'lerini bounded batch'lerle temizler. Inbox, AI sonuçları, replay geçmişi, pending/claimed/unpublished kayıtlar silinmez.
-- Tam yerel Compose yığını gerçek PostgreSQL/Redpanda hattını deterministic fake AI provider ve OTLP Collector ile ayağa kaldırır; secret'lar environment'dan zorunlu alınır ve kalıcı volume'lar açıkça yönetilir.
-- Mevcut webhook HMAC, durable-accept-then-commit, Kafka offset, timeout/caller cancellation ve değişmez success/terminal sözleşmeleri korunur. Dashboard, Kubernetes/cloud manifesti, TLS/SASL secret yönetimi ve production HA bu adımda yoktur.
+- Python AI API'ye yerel Ollama adapter'ı ekliyoruz. Adapter validated V1 snapshot'ı `POST /api/chat` ile gönderir, JSON Schema structured output ister, modelin mevcut score/level/factors değerlerini değiştirmesine izin vermez ve bounded timeout/cancellation sözleşmesini korur.
+- Framework bağımlılığı olmayan Node.js dashboard+BFF; liste, ayrıntı, health ve explicit replay akışlarını tek origin altında sunar. Query/replay credential'ları yalnız BFF environment'ında kalır; browser yalnız dar `/api/*` yüzeyini görür.
+- Tam yerel Compose yığını gerçek PostgreSQL/Redpanda hattını Ollama + varsayılan `qwen3:1.7b`, dashboard ve OTLP Collector ile ayağa kaldırır; secret'lar environment'dan zorunlu alınır ve kalıcı volume'lar açıkça yönetilir.
+- Mevcut webhook HMAC, durable-accept-then-commit, Kafka offset, timeout/caller cancellation ve değişmez success/terminal sözleşmeleri korunur. Kubernetes/cloud manifesti, TLS/SASL secret yönetimi, dashboard kullanıcı/tenant authentication'ı ve production HA bu adımda yoktur.
 
 ## Neden yapıyoruz?
 
-Backend akışının yerelde tek komutla doğrulanabilmesi, operatörün sonucu bounded biçimde okuyabilmesi, terminal failure'ı geçmişi ezmeden yeniden deneyebilmesi ve bitmiş taşıma kayıtlarının sınırsız büyümemesi aynı güvenlik sınırını tamamlar. `latestAccepted` adı domain ordering iddiasını önler; replay generation modeli audit geçmişini korur; retention bağımlı kalıcı kayıtları silmez; OTLP ise credential veya `eventId` etiketi üretmeden kapasite ayarı için ölçüm sağlar. Bu özellikler dashboard veya production platformunun yerini tutmaz: limiter'lar ve worker'lar per-instance'dır, local Compose PLAINTEXT geliştirme ortamıdır ve deployment-wide kota/HA garantisi vermez.
+Backend akışının yerelde tek komutla doğrulanabilmesi, operatörün sonucu bounded biçimde okuyup terminal failure'ı geçmişi ezmeden yeniden deneyebilmesi ve açıklama modelini ücretli bir dış API'ye veri göndermeden çalıştırabilmesi aynı geliştirme döngüsünü tamamlar. `latestAccepted` adı domain ordering iddiasını önler; replay generation modeli audit geçmişini korur; retention bağımlı kalıcı kayıtları silmez; OTLP ise credential veya `eventId` etiketi üretmeden kapasite ayarı için ölçüm sağlar. Dashboard gözlem ve kontrollü replay arayüzüdür; yeni risk kararı, kullanıcı/tenant yetkilendirmesi veya production platformu değildir. Limiter'lar ve worker'lar per-instance'dır, local Compose PLAINTEXT geliştirme ortamıdır ve deployment-wide kota/HA garantisi vermez.
 
 ## Mimari kararlar
 
@@ -355,9 +357,9 @@ Accepted delivery receipt'i silmek webhook sınırındaki duplicate response haf
 
 ### Tam yerel Docker Compose sınırı
 
-`compose.yml`; PostgreSQL 16, Redpanda, tek topic hazırlama job'u, deterministic fake provider'lı Python AI API, .NET webhook/worker API ve OpenTelemetry Collector'ı tek proje altında çalıştırır. API startup migration'larını uygular; outbox dispatcher, inbox processor, AI processor, retention ve OTLP export local profilde açıktır. PostgreSQL/Redpanda named volume kullanır; topic auto-create yerine init container tarafından açıkça oluşturulur. Sağlık kontrolleri Compose dependency sırasını belirler.
+`compose.yml`; PostgreSQL 16, Redpanda, tek topic hazırlama job'u, Ollama `0.33.2`, model hazırlama job'u, Python AI API, .NET webhook/worker API, Node dashboard/BFF ve OpenTelemetry Collector'ı tek proje altında çalıştırır. API startup migration'larını uygular; outbox dispatcher, inbox processor, AI processor, retention ve OTLP export local profilde açıktır. PostgreSQL, Redpanda ve Ollama model cache'i named volume kullanır; topic auto-create yerine init container tarafından açıkça oluşturulur. `ollama-model-init` configured modeli indirmeden Python AI API başlamaz; dashboard da .NET ve AI health koşulları sağlanınca açılır.
 
-Checked-in dosyada gerçek secret yoktur. PostgreSQL parolası, GitHub webhook secret'ı, query credential'ı ve replay credential'ı environment'dan zorunlu alınır. Kafka PLAINTEXT, collector authentication'sız ve AI provider fake'tir; portlar local geliştirme içindir. Bu yığın production deployment manifesti değildir ve TLS/SASL, secret manager, RBAC, replica/HA, backup, autoscaling ya da deployment-wide shared limiter sağlamaz.
+Checked-in dosyada gerçek secret yoktur. PostgreSQL parolası, GitHub webhook secret'ı, query credential'ı ve replay credential'ı environment'dan zorunlu alınır. Ollama local API'si authentication kullanmaz; yalnız Compose ağı/localhost geliştirme sınırında tutulmalıdır. Kafka PLAINTEXT, collector authentication'sız ve portlar local geliştirme içindir. Bu yığın production deployment manifesti değildir ve TLS/SASL, secret manager, kullanıcı RBAC'i, replica/HA, backup, autoscaling ya da deployment-wide shared limiter sağlamaz. Ollama container imajı ve model blob'u ilk çalıştırmada internetten indirilir; sonrasında named volume yeniden kullanılır. Docker Desktop/macOS GPU passthrough davranışı platforma bağlıdır; küçük default model CPU'da çalışabilir fakat yanıt süresi donanıma göre değişir.
 
 ### Outbox dispatcher claim, retry ve crash semantiği
 
@@ -461,7 +463,13 @@ Başarılı yanıt yalnız aşağıdaki sözleşmedir:
 
 `eventId` provider yanıtından alınmaz; doğrulanmış istekten servis tarafından bağlanır. Provider'ın dar yanıtı yalnız `summary` ve en az bir `recommendations` öğesi taşıyabilir. Böylece provider yeni score, level, ordering, latest-state veya deployment kararı ekleyemez. Mevcut `riskAssessment.score`, `level` ve `factors` değerleri provider request'ine aynen aktarılır; servis deterministik değerlendiriciyi yeniden çalıştırmaz.
 
-`fake` provider yalnız local/test içindir. Mevcut level/score ile factor code/points/reason değerlerinden tamamen deterministik İngilizce metin üretir; harici modele çağrı yapmaz ve AI kalitesi iddiası taşımaz. `http-json` adapter'ı ise yapılandırılan endpoint'e bearer credential ile şu dar gövdeyi gönderir:
+`fake` provider yalnız unit/integration testleri ve model olmadan sözleşme doğrulaması içindir. Mevcut level/score ile factor code/points/reason değerlerinden tamamen deterministik İngilizce metin üretir; harici modele çağrı yapmaz ve AI kalitesi iddiası taşımaz.
+
+`ollama` provider yerel `POST /api/chat` endpoint'ini kullanır. Request `stream=false`, `think=false`, düşük `temperature`, bounded `num_predict` ve `RiskExplanationContent` JSON Schema'sını taşır. System prompt modelin repository/change, score, level veya factor snapshot'ını yeniden yorumlayıp değiştirmesini yasaklar; yalnız Türkçe veya İngilizce kısa özet/öneri üretmesini ister. Dönen `message.content` önce JSON olarak ayrıştırılır, sonra Pydantic'in extra-field yasaklı sözleşmesiyle doğrulanır. Eksik/ek alan, boş recommendation, geçersiz JSON veya non-2xx başarıya çevrilmez. Local Ollama API credential istemediği için bu adapter Authorization header göndermez; güvenli sınır yalnız loopback veya Compose içindeki tam `ollama` host adıyla HTTP'ye izin verir ve path'in tam olarak `/api/chat` olmasını zorunlu tutar.
+
+Compose varsayılanı çok dilli ve görece küçük `qwen3:1.7b` modelidir; isim `RELEASEGUARD_OLLAMA_MODEL` ile değiştirilebilir. İlk `docker compose up` model blob'unu indirir ve `releaseguard-ollama` named volume'unda saklar. Model çıktısı olasılıksal olduğu için aynı envelope metinsel olarak byte-identical sonuç vermek zorunda değildir; buna karşılık immutable input ve dar output şeması korunur. Model indirimi, inference süresi, CPU/RAM gereksinimi ve üretilen önerilerin insan tarafından değerlendirilmesi operator sorumluluğudur.
+
+`http-json` adapter'ı ise yapılandırılan endpoint'e bearer credential ile şu dar gövdeyi gönderir:
 
 ```json
 {
@@ -488,13 +496,46 @@ Client DI'a typed `HttpClient` olarak kaydedilir ve yalnız `ReleaseRiskExplanat
 
 | Environment değişkeni | Kural |
 | --- | --- |
-| `RELEASEGUARD_AI_PROVIDER` | Zorunlu; yalnız `fake` veya `http-json`. |
+| `RELEASEGUARD_AI_PROVIDER` | Zorunlu; yalnız `fake`, `http-json` veya `ollama`. Compose `ollama` kullanır. |
 | `RELEASEGUARD_AI_MODEL` | Zorunlu, boş olmayan model/deployment adı. |
 | `RELEASEGUARD_AI_TIMEOUT_SECONDS` | Zorunlu, sonlu `0.1–60` saniye. |
-| `RELEASEGUARD_AI_PROVIDER_ENDPOINT` | `http-json` için zorunlu; HTTPS olmalı. Yalnız local testte loopback HTTP kabul edilir. URL credential veya fragment taşıyamaz. |
-| `RELEASEGUARD_AI_PROVIDER_API_KEY` | `http-json` için zorunlu; yalnız environment/secret provider üzerinden verilir. |
+| `RELEASEGUARD_AI_PROVIDER_ENDPOINT` | `http-json` için credential/fragment taşımayan zorunlu HTTPS/loopback URL; `ollama` için zorunlu tam `/api/chat` URL'si. Ollama HTTP yalnız loopback veya Compose `ollama` host'unda kabul edilir ve URL credential, query veya fragment taşıyamaz. |
+| `RELEASEGUARD_AI_PROVIDER_API_KEY` | `http-json` için zorunlu; yalnız environment/secret provider üzerinden verilir. Local `ollama` için bulunmamalıdır. |
+| `RELEASEGUARD_AI_OUTPUT_LANGUAGE` | İsteğe bağlı `tr` veya `en`; default `tr`. Yalnız provider metninin dilini seçer, risk snapshot'ını değiştirmez. |
 
 Eksik/geçersiz yapılandırma `releaseguard_ai.main` yüklenirken açıkça startup hatası üretir; sessiz fake fallback yoktur. Repoda credential veya çalışan provider default'u bulunmaz. `/health` yalnız process/API sağlığını bildirir ve uzak provider'ı çağırmaz; model sağlayıcısının erişilebilirlik kanıtı değildir.
+
+### Yerel dashboard ve BFF güvenlik sınırı
+
+`ReleaseGuard.Dashboard` Node.js 22'nin yalnız standart kütüphanesini kullanan, harici npm runtime bağımlılığı olmayan bir operator UI'dır. Responsive ekran; mevcut bounded sayfalı listeyi, status/arama filtresini, tek event açıklamasını, API/AI/Ollama durumunu ve yalnız terminal failed sonuç için explicit replay düğmesini sunar. Dashboard risk score'u yeniden hesaplamaz, liste contract'ında bulunmayan alanı uydurmaz ve otomatik polling yaparak read bütçesini tüketmez.
+
+Browser doğrudan .NET API'ye gitmez. Aynı process'teki BFF yalnız şu dar eşlemeleri kabul eder:
+
+| Browser yolu | Upstream sözleşmesi |
+| --- | --- |
+| `GET /api/status` | .NET/AI `/health` ve Ollama `/api/tags` sonuçlarını secret/host ayrıntısı olmadan `online/degraded/offline` olarak özetler. |
+| `GET /api/explanations?limit=&cursor=` | Bounded list route'una yalnız doğrulanmış `limit` ve opaque `cursor` aktarır. |
+| `GET /api/events/{eventId}/explanation` | Canonical GUID doğrulamasından sonra tek event query'sine gider. |
+| `GET /api/repositories/{owner}/{repo}/changes/{number}/latest` | Bounded repository/change parçalarından mevcut `latestAccepted` query'sine gider. |
+| `POST /api/events/{eventId}/replays` | Canonical event GUID ve tek canonical `Idempotency-Key` ile replay route'una gider. |
+
+Query ve replay bearer credential'ları ayrı environment değerleridir ve yalnız server-side upstream header'a eklenir; HTML/JavaScript, status response, URL veya log'a yazılmaz. BFF başka path, keyfi query, request body ya da arbitrary upstream URL proxy etmez; response body boyutu `256 KiB`, upstream süresi `100–30000 ms` configuration aralığıyla bound edilir. Upstream `Retry-After` yalnız integer delta-seconds ise korunur. Static response'lar same-origin CSP, frame yasağı, no-referrer ve nosniff header'ları taşır.
+
+Bu dashboard **yerel geliştirme/operator aracı**dır. Kendi kullanıcı login'i, session'ı, tenant/role modeli veya public-network authorization'ı yoktur; bu yüzden production'a internete açık biçimde yayımlanmamalıdır. Production fazında identity provider, kullanıcı bazlı authorization/audit, CSRF/session kararı, TLS ve deployment sınırı ayrıca tasarlanacaktır.
+
+Dashboard environment'ı:
+
+| Environment değişkeni | Kural |
+| --- | --- |
+| `DASHBOARD_HOST` | Dinleme adresi; default `0.0.0.0`. |
+| `DASHBOARD_PORT` | `1–65535`; default `3000`. |
+| `DASHBOARD_REQUEST_TIMEOUT_MILLISECONDS` | Upstream request sınırı `100–30000`; default `5000`. |
+| `RELEASEGUARD_API_BASE_URL` | .NET API için absolute HTTP(S) base URL; credential/query/fragment kabul etmez. |
+| `RELEASEGUARD_AI_BASE_URL` | AI `/health` probe'u için absolute HTTP(S) base URL. |
+| `RELEASEGUARD_OLLAMA_BASE_URL` | Ollama `/api/tags` probe'u için absolute HTTP(S) base URL. |
+| `RELEASEGUARD_QUERY_CREDENTIAL` | Proxy read işlemleri için backend ile aynı `32–512` karakter bearer token; static-only preview'da boş olabilir, Compose'ta zorunludur. |
+| `RELEASEGUARD_REPLAY_CREDENTIAL` | Proxy mutation için ayrı `32–512` karakter bearer token; static-only preview'da boş olabilir, Compose'ta zorunludur. |
+| `RELEASEGUARD_AI_PROVIDER`, `RELEASEGUARD_AI_MODEL` | Status kartında gösterilen non-secret provider/model etiketi. |
 
 ### .NET AI client yapılandırması
 
@@ -618,6 +659,19 @@ ReleaseGuardAI/
 │   │       ├── test_contracts.py
 │   │       ├── test_providers.py
 │   │       └── test_settings.py
+│   ├── ReleaseGuard.Dashboard/
+│   │   ├── Dockerfile
+│   │   ├── package.json
+│   │   ├── server.mjs
+│   │   ├── public/
+│   │   │   ├── app.js
+│   │   │   ├── index.html
+│   │   │   └── styles.css
+│   │   ├── scripts/
+│   │   │   ├── build.mjs
+│   │   │   └── check.mjs
+│   │   └── tests/
+│   │       └── server.test.mjs
 │   └── ReleaseGuard.WebhookIngestion.Api/
 │       ├── Dockerfile
 │       ├── AiExplanationClientOptions.cs
@@ -720,7 +774,7 @@ ReleaseGuardAI/
         └── TestApplicationFactory.cs
 ```
 
-Dashboard ve ek production altyapı klasörleri ihtiyaç doğduğu checkpoint'lerde oluşturulacaktır; boş yer tutucu klasörler eklenmemiştir.
+Ek production altyapı klasörleri hedef platform seçildiğinde oluşturulacaktır; boş Kubernetes/cloud yer tutucuları eklenmemiştir.
 
 ## Tekrarlanabilir komutlar
 
@@ -741,6 +795,17 @@ dotnet build ReleaseGuard.sln --no-restore
 dotnet test ReleaseGuard.sln --no-build
 ```
 
+Dashboard'ın syntax, BFF contract testleri ve static build'i için Node.js 22+ ile:
+
+```bash
+cd src/ReleaseGuard.Dashboard
+npm run check
+npm test
+npm run build
+```
+
+Harici npm paketi olmadığı için `npm install` gerekmez. Backend credential'ları olmadan `DASHBOARD_PORT=3000 npm start` yalnız static ekran/health görünümünü açar; live liste/replay BFF route'ları güvenli biçimde `503` döner. Gerçek local backend'e bağlamak için iki service credential ile API/AI/Ollama base URL'leri server process environment'ına verilmelidir; browser JavaScript'ine yazılmamalıdır. Tam Compose bu eşlemeyi otomatik yapar.
+
 ### Tam yerel Docker Compose
 
 Docker Engine açıkken dört zorunlu secret'ı shell'e literal değer yazmadan üretip bütün hattı başlatın:
@@ -756,26 +821,30 @@ docker compose up --build --wait
 docker compose ps
 ```
 
-Default host portları PostgreSQL için `55432`, Redpanda için `19092`, webhook API için `8080`, AI API için `8090`dır. Gerekirse sırasıyla `RELEASEGUARD_POSTGRES_PORT`, `RELEASEGUARD_KAFKA_PORT`, `RELEASEGUARD_API_PORT` ve `RELEASEGUARD_AI_PORT` ile değiştirilebilir. Sağlık kontrolleri:
+İlk çalıştırma official Ollama imajını ve varsayılan `qwen3:1.7b` modelini indirir; indirme boyutu ve süresi model/platform sürümüne göre değişir. Farklı bir local model için başlamadan önce `export RELEASEGUARD_OLLAMA_MODEL='model:tag'`, İngilizce metin için `export RELEASEGUARD_AI_OUTPUT_LANGUAGE='en'` kullanılabilir. Model adı hem pull job'una, AI provider'a hem dashboard status'una aynı environment üzerinden verilir.
+
+Default host portları PostgreSQL için `55432`, Redpanda için `19092`, webhook API için `8080`, AI API için `8090`, Ollama için `11434` ve dashboard için `3000`dır. Gerekirse sırasıyla `RELEASEGUARD_POSTGRES_PORT`, `RELEASEGUARD_KAFKA_PORT`, `RELEASEGUARD_API_PORT`, `RELEASEGUARD_AI_PORT`, `RELEASEGUARD_OLLAMA_PORT` ve `RELEASEGUARD_DASHBOARD_PORT` ile değiştirilebilir. Sağlık kontrolleri:
 
 ```bash
 curl --fail http://localhost:8080/health
 curl --fail http://localhost:8090/health
+curl --fail http://localhost:3000/api/status
+curl --fail http://localhost:11434/api/tags
 docker compose exec redpanda \
   rpk topic describe releaseguard.release-risk-assessed \
   -X brokers=redpanda:9092
 docker compose exec postgres \
-  psql -U postgres -d releaseguard -c \
+  psql -U releaseguard -d releaseguard -c \
   'SELECT max(version) AS schema_version FROM release_guard_schema_migrations;'
 ```
 
-API/worker, AI ve OTLP sinyallerini incelemek için `docker compose logs webhook-api ai-explanation otel-collector`; yığını durdurup veriyi korumak için `docker compose down` kullanılır. Aşağıdaki komut **yalnız silinebilir local veri için** container'larla birlikte PostgreSQL ve Redpanda volume'larını da kaldırır:
+Dashboard `http://localhost:3000` adresindedir. API/worker, AI, Ollama, dashboard ve OTLP sinyallerini incelemek için `docker compose logs webhook-api ai-explanation ollama dashboard otel-collector`; yığını durdurup veriyi korumak için `docker compose down` kullanılır. Aşağıdaki komut **yalnız silinebilir local veri için** container'larla birlikte PostgreSQL, Redpanda ve indirilmiş Ollama model volume'larını da kaldırır:
 
 ```bash
 docker compose down --volumes --remove-orphans
 ```
 
-Compose, deterministic fake AI provider kullanır ve dış modele/ücretli servise bağlanmaz. PLAINTEXT Kafka, authentication'sız local collector ve environment secret'ları production güvenlik modeli değildir.
+Compose ücretli model API'sine bağlanmaz; model inference'ı local Ollama'da çalışır. İmaj/modelin ilk indirilmesi için internet gerekir. PLAINTEXT Kafka, authentication'sız local Ollama/collector, dashboard'da kullanıcı login'i bulunmaması ve environment secret'ları production güvenlik modeli değildir.
 
 Python 3.9+ AI servisini ayrı sanal ortamda kurup doğrulamak için:
 
@@ -810,6 +879,21 @@ export RELEASEGUARD_AI_TIMEOUT_SECONDS='5'
 .venv/bin/uvicorn releaseguard_ai.main:app \
   --host 127.0.0.1 --port 8090
 ```
+
+Makinede ayrı kurulu Ollama ile Python servisini Compose dışında çalıştırmak için önce modeli indirin, ardından tam chat endpoint'ini verin:
+
+```bash
+ollama pull qwen3:1.7b
+export RELEASEGUARD_AI_PROVIDER='ollama'
+export RELEASEGUARD_AI_MODEL='qwen3:1.7b'
+export RELEASEGUARD_AI_PROVIDER_ENDPOINT='http://127.0.0.1:11434/api/chat'
+export RELEASEGUARD_AI_OUTPUT_LANGUAGE='tr'
+export RELEASEGUARD_AI_TIMEOUT_SECONDS='60'
+.venv/bin/uvicorn releaseguard_ai.main:app \
+  --host 127.0.0.1 --port 8090
+```
+
+Local Ollama provider için `RELEASEGUARD_AI_PROVIDER_API_KEY` verilmez. `http://remote-host/...` reddedilir; local olmayan bir Ollama gateway'i kullanılacaksa TLS, authentication ve ağ sınırı production tasarımında ayrıca çözülmelidir.
 
 Bağımsız .NET client yapılandırmasının aynı local servisi göstermesi için webhook host ortamında:
 
@@ -1158,7 +1242,7 @@ Bu sorgu yalnız terminal işleri okur; pending/başarılı işleri, raw Kafka p
 
 ## Nasıl doğruladık?
 
-Bu backend tamamlaması aşağıdaki sınırlarla doğrulanır:
+Backend + local AI + dashboard tamamlaması aşağıdaki sınırlarla doğrulanır:
 
 1. OTLP options default/sınır/fail-fast testleri ve gerçek HTTP protobuf collector testi yalnız stabil query meter/instrument'larının export edildiğini; kapalı modun dış I/O yapmadığını doğrular.
 2. Read endpoint testleri authentication'ın `401` önceliğini, active/previous ortak global bütçeyi, malformed parametrelerin DB öncesinde sonlanmasını, cursor canonicality/keyset sınırını, `latestAccepted` seçimini ve timeout/caller cancellation ayrımını kapsar.
@@ -1166,16 +1250,15 @@ Bu backend tamamlaması aşağıdaki sınırlarla doğrulanır:
 4. Gerçek PostgreSQL testleri replay sonrası V006 terminal satırının byte/kolon olarak değişmediğini, processor'ın yeni generation'ı tamamladığını ve effective query'nin yeni sonucu gösterdiğini doğrular.
 5. Retention options/store testleri yalnız yayımlanmış+durable outbox, bağımlılığı kalmamış accepted receipt ve eski ignored receipt'in silindiğini; pending/claimed/unpublished outbox, inbox ve replay history'nin korunduğunu doğrular.
 6. Mevcut webhook HMAC/idempotency, V1 outbox/Kafka, durable-accept-then-commit, AI retry/terminal/DLQ, query `401/200/400/404/429/503`, `/health` ve gerçek local Uvicorn regresyon paketleri aynen çalışır.
-7. `docker compose config`, iki image build'i ve `docker compose up --wait` sonrasında health, V008 şema, topic, imzalı GitHub webhook → Kafka → inbox → completed AI query ve collector'daki üç query metriği gerçek container'larla uçtan uca doğrulanır; ardından local test volume'ları temizlenir.
-8. Python Ruff lint/format/compile + tüm Python testleri ile `.NET format`, restore, warning-as-error build ve Testcontainers PostgreSQL/Redpanda dahil tüm .NET testleri tamamlanır; entegrasyonlar Docker yokken sessizce atlanmaz.
+7. Ollama options/provider testleri local endpoint sınırını, API key bulunmamasını, structured non-streaming chat request'ini, Türkçe/İngilizce prompt'u, strict response validation'ı ve timeout/cancellation ayrımını kapsar.
+8. Dashboard testleri options fail-fast'i, list parametre allowlist'ini, query/replay credential ayrımını, canonical idempotency key'i, status response'unda secret/host sızmamasını ve browser security header'larını gerçek localhost server üzerinden doğrular.
+9. `docker compose config`, üç uygulama image build'i ve `docker compose up --wait` sonrasında Ollama model readiness, health, V008 şema ve topic gerçek container'larla doğrulanır. İmzalı GitHub webhook → outbox/Kafka → inbox → Ollama → immutable completed AI query → dashboard list/detail zinciri gerçek `qwen3:1.7b` modeliyle uçtan uca çalıştırılır.
+10. Python Ruff lint/format/compile + tüm Python testleri, Node syntax/test/static build ile `.NET format`, restore, warning-as-error build ve Testcontainers PostgreSQL/Redpanda dahil tüm .NET testleri tamamlanır; entegrasyonlar Docker yokken sessizce atlanmaz.
 
-Son doğrulamada Python Ruff lint/format/compile kontrolleri ve `42/42` Python testi başarılı oldu. `.NET format` ve restore tamamlandı; warning-as-error build `0 uyarı / 0 hata`, gerçek PostgreSQL 16, Redpanda, OTLP collector listener'ı ve local Uvicorn sözleşmesi dahil .NET paketi `323/323 başarılı, 0 atlanan` sonucunu verdi. Toplam `365` test başarılıdır. Ayrıca `docker compose config`, iki image build'i ve tam yığın `up --wait` koşusu; V008 şema, topic, imzalı webhook'tan completed AI açıklamasına kadar uçtan uca akış ve OTLP metric export ile doğrulandı. Sonunda yalnız `releaseguard-local` test container/network/volume'ları kaldırıldı.
+Son doğrulamada Python Ruff lint/format/compile kontrolleri ve Ollama adapter'ı dahil `56/56` Python testi başarılı oldu. `.NET format` ve restore tamamlandı; warning-as-error build `0 uyarı / 0 hata`, gerçek PostgreSQL 16, Redpanda, OTLP collector listener'ı ve local Uvicorn sözleşmesi dahil .NET paketi `323/323 başarılı, 0 atlanan` sonucunu verdi. Dashboard syntax/static build kontrolleri ve gerçek localhost BFF üzerinden `6/6` Node testi geçti. Toplam `385` test başarılıdır. Ayrıca `docker compose config`, üç uygulama image build'i, official Ollama image/model hazırlığı ve tam yığın `up --wait` koşusu; imzalı webhook'tan gerçek local modelle üretilen completed AI açıklamasının dashboard BFF'de görünmesine kadar doğrulandı.
 
 ## Sıradaki küçük adım
 
-README'deki backend checkpoint zinciri ve tam local Compose akışı tamamlanmıştır. Kullanıcı kararı gereği sıradaki iki ayrı ürün fazı şimdi uygulanmaz:
+Backend checkpoint zinciri, ücretsiz local Ollama entegrasyonu, operator dashboard'u ve tam local Compose akışı tamamlanmıştır. Sıradaki tek faz production readiness'tir; kullanıcı kararı gereği şimdi uygulanmaz.
 
-- Dashboard: salt-okunur API tüketimi, kullanıcı/tenant authorization modeli ve UX ihtiyaçları ayrı ürün sözleşmesiyle ele alınmalıdır.
-- Production: TLS/SASL, secret manager, DB/Kafka/collector HA, deployment-wide shared limiting, migration job/least privilege, backup/restore, retention/legal-hold politikası, alarm/SLO ve orchestration manifestleri hedef platform seçildikten sonra tasarlanmalıdır.
-
-Bu fazlardan biri açıkça başlatılana kadar backend sözleşmesine yeni route, rol matrisi, deploy kararı veya platform varsayımı eklenmemelidir.
+Bu faz başlamadan önce hedef platform ve identity provider seçilmelidir. Ardından dashboard kullanıcı/session/tenant authorization'ı, TLS/SASL, secret manager, DB/Kafka/Ollama/collector HA, deployment-wide shared limiting, migration job/least privilege, backup/restore, retention/legal-hold, alarm/SLO ve orchestration manifestleri tek production tehdit modeli altında tasarlanmalıdır. Bu karar verilene kadar local dashboard internete açılmamalı ve depoya varsayımsal Kubernetes/cloud manifesti ya da rol matrisi eklenmemelidir.

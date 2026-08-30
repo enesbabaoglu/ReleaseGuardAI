@@ -53,6 +53,23 @@ def test_http_json_provider_allows_loopback_http_for_local_testing() -> None:
     assert settings.provider_endpoint == "http://127.0.0.1:8090/explain"
 
 
+def test_ollama_provider_accepts_local_compose_endpoint_without_api_key() -> None:
+    settings = AiExplanationSettings.from_environment(
+        {
+            "RELEASEGUARD_AI_PROVIDER": "ollama",
+            "RELEASEGUARD_AI_MODEL": "qwen3:1.7b",
+            "RELEASEGUARD_AI_TIMEOUT_SECONDS": "30",
+            "RELEASEGUARD_AI_PROVIDER_ENDPOINT": "http://ollama:11434/api/chat",
+            "RELEASEGUARD_AI_OUTPUT_LANGUAGE": "tr",
+        }
+    )
+
+    assert settings.provider == "ollama"
+    assert settings.provider_endpoint == "http://ollama:11434/api/chat"
+    assert settings.provider_api_key is None
+    assert settings.output_language == "tr"
+
+
 @pytest.mark.parametrize(
     "environment",
     [
@@ -106,6 +123,36 @@ def test_http_json_provider_allows_loopback_http_for_local_testing() -> None:
             "RELEASEGUARD_AI_TIMEOUT_SECONDS": "1",
             "RELEASEGUARD_AI_PROVIDER_ENDPOINT": "https://user:pass@models.example/x",
             "RELEASEGUARD_AI_PROVIDER_API_KEY": "secret",
+        },
+        {
+            "RELEASEGUARD_AI_PROVIDER": "ollama",
+            "RELEASEGUARD_AI_MODEL": "qwen3:1.7b",
+            "RELEASEGUARD_AI_TIMEOUT_SECONDS": "30",
+        },
+        {
+            "RELEASEGUARD_AI_PROVIDER": "ollama",
+            "RELEASEGUARD_AI_MODEL": "qwen3:1.7b",
+            "RELEASEGUARD_AI_TIMEOUT_SECONDS": "30",
+            "RELEASEGUARD_AI_PROVIDER_ENDPOINT": "http://remote.example/api/chat",
+        },
+        {
+            "RELEASEGUARD_AI_PROVIDER": "ollama",
+            "RELEASEGUARD_AI_MODEL": "qwen3:1.7b",
+            "RELEASEGUARD_AI_TIMEOUT_SECONDS": "30",
+            "RELEASEGUARD_AI_PROVIDER_ENDPOINT": "http://ollama:11434/api/generate",
+        },
+        {
+            "RELEASEGUARD_AI_PROVIDER": "ollama",
+            "RELEASEGUARD_AI_MODEL": "qwen3:1.7b",
+            "RELEASEGUARD_AI_TIMEOUT_SECONDS": "30",
+            "RELEASEGUARD_AI_PROVIDER_ENDPOINT": "http://ollama:11434/api/chat",
+            "RELEASEGUARD_AI_PROVIDER_API_KEY": "must-not-be-used",
+        },
+        {
+            "RELEASEGUARD_AI_PROVIDER": "fake",
+            "RELEASEGUARD_AI_MODEL": "model",
+            "RELEASEGUARD_AI_TIMEOUT_SECONDS": "1",
+            "RELEASEGUARD_AI_OUTPUT_LANGUAGE": "de",
         },
     ],
 )

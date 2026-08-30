@@ -57,14 +57,43 @@ services:
         --brokers redpanda:9092
     restart: "no"
 
+  ollama:
+    image: ollama/ollama:0.33.2
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    ports:
+      - "${RELEASEGUARD_OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - releaseguard-ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+
+  ollama-model-init:
+    image: ollama/ollama:0.33.2
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      RELEASEGUARD_OLLAMA_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ['ollama pull "$${RELEASEGUARD_OLLAMA_MODEL}"']
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   ai-explanation:
     build:
       context: .
       dockerfile: src/ReleaseGuard.AiExplanation.Api/Dockerfile
     environment:
-      RELEASEGUARD_AI_PROVIDER: fake
-      RELEASEGUARD_AI_MODEL: deterministic-local
-      RELEASEGUARD_AI_TIMEOUT_SECONDS: "5"
+      RELEASEGUARD_AI_PROVIDER: ollama
+      RELEASEGUARD_AI_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+      RELEASEGUARD_AI_TIMEOUT_SECONDS: "60"
+      RELEASEGUARD_AI_PROVIDER_ENDPOINT: http://ollama:11434/api/chat
+      RELEASEGUARD_AI_OUTPUT_LANGUAGE: ${RELEASEGUARD_AI_OUTPUT_LANGUAGE:-tr}
     ports:
       - "${RELEASEGUARD_AI_PORT:-8090}:8080"
     healthcheck:
@@ -78,6 +107,9 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
+    depends_on:
+      ollama-model-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   otel-collector:
@@ -138,6 +170,44 @@ services:
       retries: 40
     restart: unless-stopped
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: src/ReleaseGuard.Dashboard/Dockerfile
+    environment:
+      DASHBOARD_PORT: "3000"
+      DASHBOARD_REQUEST_TIMEOUT_MILLISECONDS: "5000"
+      RELEASEGUARD_API_BASE_URL: http://webhook-api:8080
+      RELEASEGUARD_AI_BASE_URL: http://ai-explanation:8080
+      RELEASEGUARD_OLLAMA_BASE_URL: http://ollama:11434
+      RELEASEGUARD_QUERY_CREDENTIAL: ${RELEASEGUARD_QUERY_CREDENTIAL:?Set RELEASEGUARD_QUERY_CREDENTIAL}
+      RELEASEGUARD_REPLAY_CREDENTIAL: ${RELEASEGUARD_REPLAY_CREDENTIAL:?Set RELEASEGUARD_REPLAY_CREDENTIAL}
+      RELEASEGUARD_AI_PROVIDER: ollama
+      RELEASEGUARD_AI_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+    ports:
+      - "${RELEASEGUARD_DASHBOARD_PORT:-3000}:3000"
+    depends_on:
+      webhook-api:
+        condition: service_healthy
+      ai-explanation:
+        condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/').then(response => {
+            if (!response.ok) process.exit(1)
+          }).catch(() => process.exit(1))
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
 volumes:
   releaseguard-postgres:
   releaseguard-redpanda:
+  releaseguard-ollama:

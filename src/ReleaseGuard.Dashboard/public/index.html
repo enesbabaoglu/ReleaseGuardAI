@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="ReleaseGuard teslimat riski operasyon ekranı" />
+    <title>ReleaseGuard · Operasyon Merkezi</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="ReleaseGuard ana sayfa">
+          <span class="brand-mark" aria-hidden="true">RG</span>
+          <span><strong>ReleaseGuard</strong><small>Operasyon Merkezi</small></span>
+        </a>
+        <div class="service-strip" aria-label="Servis durumu" id="service-strip">
+          <span><i class="signal" id="api-signal"></i> Webhook API</span>
+          <span><i class="signal" id="ai-signal"></i> AI API</span>
+          <span><i class="signal" id="ollama-signal"></i> Ollama</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <p class="eyebrow">RELEASE INTELLIGENCE / <span id="connection-label">BAĞLANIYOR</span></p>
+            <h1>Teslimat riski,<br /><em>tek bakışta.</em></h1>
+            <p class="hero-copy">GitHub webhook’larından üretilen risk değerlendirmelerini izle, yerel AI açıklamalarını incele ve başarısız işleri güvenle yeniden çalıştır.</p>
+          </div>
+          <button class="refresh-button" type="button" id="refresh-button">
+            <span aria-hidden="true">↻</span> Verileri yenile
+          </button>
+        </section>
+
+        <section class="metrics" aria-label="Özet metrikler">
+          <article><span>Yüklenen kayıt</span><strong id="total-count">—</strong><small>bounded liste</small></article>
+          <article><span>Tamamlandı</span><strong id="completed-count">—</strong><small class="good" id="success-rate">başarı oranı</small></article>
+          <article><span>Bekliyor</span><strong id="pending-count">—</strong><small>işlenmeyi bekliyor</small></article>
+          <article class="metric-alert"><span>Başarısız</span><strong id="failed-count">—</strong><small>operatör dikkati</small></article>
+        </section>
+
+        <section class="workspace">
+          <div class="list-panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">RİSK AKIŞI</p><h2>AI açıklamaları</h2></div>
+              <div class="filters">
+                <label class="search"><span aria-hidden="true">⌕</span><span class="sr-only">Kayıtlarda ara</span><input id="search-input" type="search" placeholder="Repo veya değişiklik ara" /></label>
+                <label class="status-filter"><span class="sr-only">Duruma göre filtrele</span><select id="status-filter"><option value="all">Tüm durumlar</option><option value="completed">Tamamlandı</option><option value="pending">Bekliyor</option><option value="failed">Başarısız</option></select></label>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Depo / Değişiklik</th><th>Olay türü</th><th>Durum</th><th>Kabul edildi</th></tr></thead>
+                <tbody id="risk-table"><tr class="loading-row"><td colspan="4">Risk akışı yükleniyor…</td></tr></tbody>
+              </table>
+            </div>
+            <div class="list-footer"><p id="list-message" role="status">ReleaseGuard API bekleniyor.</p><button id="load-more-button" class="secondary-button" type="button" hidden>Daha eski kayıtları getir</button></div>
+          </div>
+
+          <aside class="detail-panel" aria-label="Seçili risk ayrıntısı">
+            <div class="detail-top"><p class="eyebrow">SEÇİLİ KAYIT</p><span class="status neutral" id="detail-status">Bekleniyor</span></div>
+            <h2 id="detail-title">Bir kayıt seçin</h2>
+            <div class="event-block"><span class="event-icon" aria-hidden="true">◎</span><div><strong id="detail-kind">AI açıklama yaşam döngüsü</strong><p id="detail-time">Listeden bir olaya tıklayın.</p></div></div>
+            <div class="explanation">
+              <h3>Yerel AI değerlendirmesi</h3>
+              <p id="detail-summary">Ollama tarafından üretilen açıklama burada görünecek. Skor ve faktörler backend’deki immutable değerlendirmeden değiştirilmeden kullanılır.</p>
+            </div>
+            <div class="recommendations">
+              <h3>Önerilen kontroller</h3>
+              <ol id="detail-recommendations"><li>Kayıt ayrıntısını yüklemek için bir satır seçin.</li></ol>
+            </div>
+            <div class="failure-box" id="failure-box" hidden><h3>Terminal hata</h3><p id="failure-reason"></p><button class="replay-button" id="replay-button" type="button">Güvenli replay başlat</button></div>
+            <dl class="metadata"><div><dt>AI sağlayıcı</dt><dd id="detail-provider">Ollama</dd></div><div><dt>Model</dt><dd id="detail-model">qwen3:1.7b</dd></div><div><dt>Event ID</dt><dd id="detail-event-id">—</dd></div></dl>
+          </aside>
+        </section>
+      </main>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
