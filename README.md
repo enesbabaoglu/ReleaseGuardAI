@@ -6,8 +6,15 @@ Proje; imzalı GitHub webhook kabulü, deterministik risk puanlama, PostgreSQL t
 
 > Mevcut sürüm GitHub `pull_request` olaylarının `opened` ve `synchronize` action'larını işler. Ham kaynak kod diff'i, CI sonucu veya gerçek deployment kararı henüz risk girdisi değildir.
 
+## Demo
+
+![ReleaseGuard AI dashboard demo](docs/assets/releaseguard-demo.gif)
+
+GIF, tam yerel Compose yığınında çalışan Keycloak korumalı dashboard'u gösterir. Ekrandaki `microsoft/vscode` kayıtları public GitHub PR metadata'sıyla yerel imzalı webhook → PostgreSQL → Kafka → inbox → Ollama hattının uçtan uca doğrulanmasından alınmıştır; GitHub'ın doğrudan gönderdiği production teslimatları değildir.
+
 ## İçindekiler
 
+- [Demo](#demo)
 - [Neler sunuyor?](#neler-sunuyor)
 - [Mimari](#mimari)
 - [Nasıl çalışır?](#nasıl-çalışır)
