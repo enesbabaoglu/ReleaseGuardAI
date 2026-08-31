@@ -119,6 +119,34 @@ services:
       - ./deploy/local/otel-collector-config.yml:/etc/otelcol/config.yml:ro
     restart: unless-stopped
 
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.2
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${RELEASEGUARD_KEYCLOAK_ADMIN_USERNAME:?Set RELEASEGUARD_KEYCLOAK_ADMIN_USERNAME}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${RELEASEGUARD_KEYCLOAK_ADMIN_PASSWORD:?Set RELEASEGUARD_KEYCLOAK_ADMIN_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: http://localhost:${RELEASEGUARD_KEYCLOAK_PORT:-8180}
+      RELEASEGUARD_DASHBOARD_EXTERNAL_URL: http://localhost:${RELEASEGUARD_DASHBOARD_PORT:-3000}
+      RELEASEGUARD_KEYCLOAK_LOCAL_USERNAME: ${RELEASEGUARD_KEYCLOAK_LOCAL_USERNAME:?Set RELEASEGUARD_KEYCLOAK_LOCAL_USERNAME}
+      RELEASEGUARD_KEYCLOAK_LOCAL_PASSWORD: ${RELEASEGUARD_KEYCLOAK_LOCAL_PASSWORD:?Set RELEASEGUARD_KEYCLOAK_LOCAL_PASSWORD}
+    ports:
+      - "${RELEASEGUARD_KEYCLOAK_PORT:-8180}:8080"
+    volumes:
+      - ./deploy/local/keycloak/releaseguard-realm.json:/opt/keycloak/data/import/releaseguard-realm.json:ro
+      - releaseguard-keycloak:/opt/keycloak/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf "GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -q "200 OK" <&3'
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+
   webhook-api:
     build:
       context: .
@@ -184,6 +212,16 @@ services:
       RELEASEGUARD_REPLAY_CREDENTIAL: ${RELEASEGUARD_REPLAY_CREDENTIAL:?Set RELEASEGUARD_REPLAY_CREDENTIAL}
       RELEASEGUARD_AI_PROVIDER: ollama
       RELEASEGUARD_AI_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+      DASHBOARD_AUTH_ENABLED: "true"
+      DASHBOARD_EXTERNAL_URL: http://localhost:${RELEASEGUARD_DASHBOARD_PORT:-3000}
+      DASHBOARD_SECURE_COOKIE: "false"
+      DASHBOARD_SESSION_LIFETIME_SECONDS: "28800"
+      RELEASEGUARD_OIDC_DISCOVERY_URL: http://keycloak:8080/realms/releaseguard/.well-known/openid-configuration
+      RELEASEGUARD_OIDC_ISSUER: http://localhost:${RELEASEGUARD_KEYCLOAK_PORT:-8180}/realms/releaseguard
+      RELEASEGUARD_OIDC_BACKCHANNEL_BASE_URL: http://keycloak:8080
+      RELEASEGUARD_OIDC_CLIENT_ID: releaseguard-dashboard
+      RELEASEGUARD_OIDC_VIEWER_ROLE: releaseguard-viewer
+      RELEASEGUARD_OIDC_OPERATOR_ROLE: releaseguard-operator
     ports:
       - "${RELEASEGUARD_DASHBOARD_PORT:-3000}:3000"
     depends_on:
@@ -193,13 +231,15 @@ services:
         condition: service_healthy
       ollama-model-init:
         condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
         - node
         - -e
         - >-
-          fetch('http://127.0.0.1:3000/').then(response => {
+          fetch('http://127.0.0.1:3000/healthz').then(response => {
             if (!response.ok) process.exit(1)
           }).catch(() => process.exit(1))
       interval: 3s
@@ -211,3 +251,4 @@ volumes:
   releaseguard-postgres:
   releaseguard-redpanda:
   releaseguard-ollama:
+  releaseguard-keycloak:

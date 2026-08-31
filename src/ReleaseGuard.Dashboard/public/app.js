@@ -23,6 +23,10 @@ const elements = {
   failureBox: document.querySelector("#failure-box"),
   failureReason: document.querySelector("#failure-reason"),
   replayButton: document.querySelector("#replay-button"),
+  failureRoleMessage: document.querySelector("#failure-role-message"),
+  accountName: document.querySelector("#account-name"),
+  accountRole: document.querySelector("#account-role"),
+  logoutButton: document.querySelector("#logout-button"),
   toast: document.querySelector("#toast"),
 };
 
@@ -33,6 +37,10 @@ const state = {
   aiProvider: "ollama",
   aiModel: "qwen3:1.7b",
   toastTimer: null,
+  authEnabled: false,
+  canView: false,
+  canReplay: false,
+  csrfToken: null,
 };
 
 const statusLabels = new Map([
@@ -203,6 +211,8 @@ async function selectItem(item) {
       elements.detailSummary.textContent = "AI açıklaması terminal bir hatayla tamamlanamadı.";
       elements.detailRecommendations.replaceChildren(createTextElement("li", "Hata giderildikten sonra aynı event için idempotent replay başlatabilirsiniz."));
       elements.failureReason.textContent = `${body.failure.code ?? "provider_failure"}: ${body.failure.reason}`;
+      elements.replayButton.hidden = !state.canReplay;
+      elements.failureRoleMessage.hidden = state.canReplay;
       elements.failureBox.hidden = false;
       return;
     }
@@ -215,14 +225,17 @@ async function selectItem(item) {
 }
 
 async function requestReplay() {
-  if (!state.selectedEventId) {
+  if (!state.selectedEventId || !state.canReplay) {
     return;
   }
   setBusy(elements.replayButton, true, "Replay kaydediliyor…");
   try {
     await requestJson(`/api/events/${encodeURIComponent(state.selectedEventId)}/replays`, {
       method: "POST",
-      headers: { "Idempotency-Key": crypto.randomUUID() },
+      headers: {
+        "Idempotency-Key": crypto.randomUUID(),
+        ...(state.csrfToken ? { "X-CSRF-Token": state.csrfToken } : {}),
+      },
     });
     showToast("Replay isteği kabul edildi; sonuç immutable yeni generation olarak yazılacak.");
     await refreshList();
@@ -242,11 +255,48 @@ async function requestJson(url, options) {
     throw new Error("Sunucu geçerli JSON döndürmedi.");
   }
   if (!response.ok) {
+    if (response.status === 401 && url !== "/api/session") {
+      window.location.assign("/login");
+    }
     const retryAfter = response.headers.get("Retry-After");
     const detail = typeof body?.detail === "string" ? body.detail : "İstek tamamlanamadı.";
     throw new Error(retryAfter ? `${detail} ${retryAfter} saniye sonra yeniden deneyin.` : detail);
   }
   return { body, response };
+}
+
+async function loadSession() {
+  let body;
+  try {
+    ({ body } = await requestJson("/api/session"));
+  } catch (error) {
+    window.location.assign("/login");
+    throw error;
+  }
+  state.authEnabled = body?.authEnabled === true;
+  state.canView = body?.canView === true;
+  state.canReplay = body?.canReplay === true;
+  state.csrfToken = typeof body?.csrfToken === "string" ? body.csrfToken : null;
+  elements.accountName.textContent = typeof body?.user?.displayName === "string" ? body.user.displayName : "ReleaseGuard kullanıcısı";
+  elements.accountRole.textContent = state.authEnabled
+    ? state.canReplay ? "OPERATOR" : state.canView ? "VIEWER" : "YETKİSİZ"
+    : "YEREL MOD";
+  elements.logoutButton.hidden = !state.authEnabled;
+}
+
+async function logout() {
+  if (!state.authEnabled || !state.csrfToken) return;
+  setBusy(elements.logoutButton, true, "Çıkılıyor…");
+  try {
+    const { body } = await requestJson("/api/logout", {
+      method: "POST",
+      headers: { "X-CSRF-Token": state.csrfToken },
+    });
+    window.location.assign(body.redirectTo);
+  } catch (error) {
+    showToast(error.message, true);
+    setBusy(elements.logoutButton, false, "Çıkış");
+  }
 }
 
 function isListItem(item) {
@@ -316,5 +366,7 @@ elements.loadMoreButton.addEventListener("click", () => refreshList({ append: tr
 elements.searchInput.addEventListener("input", renderList);
 elements.statusFilter.addEventListener("change", renderList);
 elements.replayButton.addEventListener("click", requestReplay);
+elements.logoutButton.addEventListener("click", logout);
 
+await loadSession();
 await Promise.all([refreshStatus(), refreshList()]);

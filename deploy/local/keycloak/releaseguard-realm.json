@@ -1,0 +1,98 @@
+{
+  "realm": "releaseguard",
+  "enabled": true,
+  "displayName": "ReleaseGuard Local",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "bruteForceProtected": true,
+  "clients": [
+    {
+      "clientId": "releaseguard-dashboard",
+      "name": "ReleaseGuard Dashboard",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "rootUrl": "${RELEASEGUARD_DASHBOARD_EXTERNAL_URL}",
+      "baseUrl": "${RELEASEGUARD_DASHBOARD_EXTERNAL_URL}",
+      "redirectUris": [
+        "${RELEASEGUARD_DASHBOARD_EXTERNAL_URL}/auth/callback"
+      ],
+      "webOrigins": [
+        "${RELEASEGUARD_DASHBOARD_EXTERNAL_URL}"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${RELEASEGUARD_DASHBOARD_EXTERNAL_URL}/signed-out"
+      },
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "releaseguard client roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "usermodel.clientRoleMapping.clientId": "releaseguard-dashboard",
+            "multivalued": "true",
+            "userinfo.token.claim": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "resource_access.releaseguard-dashboard.roles",
+            "jsonType.label": "String"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "roles",
+        "profile",
+        "email"
+      ]
+    }
+  ],
+  "roles": {
+    "client": {
+      "releaseguard-dashboard": [
+        {
+          "name": "releaseguard-viewer",
+          "description": "ReleaseGuard read-only dashboard access"
+        },
+        {
+          "name": "releaseguard-operator",
+          "description": "ReleaseGuard dashboard access with explicit replay authorization"
+        }
+      ]
+    }
+  },
+  "users": [
+    {
+      "username": "${RELEASEGUARD_KEYCLOAK_LOCAL_USERNAME}",
+      "firstName": "ReleaseGuard",
+      "lastName": "Operator",
+      "email": "releaseguard-operator@localhost.invalid",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RELEASEGUARD_KEYCLOAK_LOCAL_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "clientRoles": {
+        "releaseguard-dashboard": [
+          "releaseguard-operator"
+        ]
+      }
+    }
+  ]
+}

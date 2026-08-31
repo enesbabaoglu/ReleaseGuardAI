@@ -6,6 +6,7 @@ WORKDIR /app
 
 COPY src/ReleaseGuard.Dashboard/package.json ./
 COPY src/ReleaseGuard.Dashboard/server.mjs ./
+COPY src/ReleaseGuard.Dashboard/auth.mjs ./
 COPY src/ReleaseGuard.Dashboard/public/ ./public/
 
 USER node

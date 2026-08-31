@@ -3,6 +3,8 @@ import { readFile, stat } from "node:fs/promises";
 import { extname, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { OidcBoundaryError, OidcSessionBoundary } from "./auth.mjs";
+
 const root = fileURLToPath(new URL(".", import.meta.url));
 const staticRoot = resolve(root, "public");
 const canonicalGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -25,6 +27,20 @@ function loadConfig(environment = process.env) {
     30000,
   );
 
+  const authEnabled = parseBoolean(environment.DASHBOARD_AUTH_ENABLED ?? "false", "DASHBOARD_AUTH_ENABLED");
+  const externalUrl = authEnabled
+    ? parseOriginUrl(environment.DASHBOARD_EXTERNAL_URL, "DASHBOARD_EXTERNAL_URL")
+    : null;
+  const secureCookie = authEnabled
+    ? parseBoolean(
+      environment.DASHBOARD_SECURE_COOKIE ?? String(externalUrl.protocol === "https:"),
+      "DASHBOARD_SECURE_COOKIE",
+    )
+    : false;
+  if (authEnabled && (secureCookie !== (externalUrl.protocol === "https:"))) {
+    throw new Error("DASHBOARD_SECURE_COOKIE HTTPS external URL için true, HTTP local URL için false olmalıdır.");
+  }
+
   return Object.freeze({
     host: environment.DASHBOARD_HOST?.trim() || "0.0.0.0",
     port,
@@ -36,7 +52,41 @@ function loadConfig(environment = process.env) {
     replayCredential: parseCredential(environment.RELEASEGUARD_REPLAY_CREDENTIAL, "RELEASEGUARD_REPLAY_CREDENTIAL"),
     aiProvider: parseLabel(environment.RELEASEGUARD_AI_PROVIDER ?? "ollama", "RELEASEGUARD_AI_PROVIDER"),
     aiModel: parseLabel(environment.RELEASEGUARD_AI_MODEL ?? "qwen3:1.7b", "RELEASEGUARD_AI_MODEL"),
+    auth: Object.freeze({
+      enabled: authEnabled,
+      externalUrl,
+      secureCookie,
+      discoveryUrl: authEnabled
+        ? parseBaseUrl(required(environment.RELEASEGUARD_OIDC_DISCOVERY_URL, "RELEASEGUARD_OIDC_DISCOVERY_URL"), "RELEASEGUARD_OIDC_DISCOVERY_URL")
+        : null,
+      issuer: authEnabled
+        ? parseBaseUrl(required(environment.RELEASEGUARD_OIDC_ISSUER, "RELEASEGUARD_OIDC_ISSUER"), "RELEASEGUARD_OIDC_ISSUER")
+        : null,
+      backchannelBaseUrl: authEnabled
+        ? parseOriginUrl(required(environment.RELEASEGUARD_OIDC_BACKCHANNEL_BASE_URL, "RELEASEGUARD_OIDC_BACKCHANNEL_BASE_URL"), "RELEASEGUARD_OIDC_BACKCHANNEL_BASE_URL")
+        : null,
+      clientId: authEnabled
+        ? parseIdentifier(environment.RELEASEGUARD_OIDC_CLIENT_ID ?? "releaseguard-dashboard", "RELEASEGUARD_OIDC_CLIENT_ID")
+        : null,
+      viewerRole: authEnabled
+        ? parseIdentifier(environment.RELEASEGUARD_OIDC_VIEWER_ROLE ?? "releaseguard-viewer", "RELEASEGUARD_OIDC_VIEWER_ROLE")
+        : null,
+      operatorRole: authEnabled
+        ? parseIdentifier(environment.RELEASEGUARD_OIDC_OPERATOR_ROLE ?? "releaseguard-operator", "RELEASEGUARD_OIDC_OPERATOR_ROLE")
+        : null,
+      sessionLifetimeSeconds: authEnabled
+        ? parseBoundedInteger(environment.DASHBOARD_SESSION_LIFETIME_SECONDS ?? "28800", "DASHBOARD_SESSION_LIFETIME_SECONDS", 300, 28800)
+        : null,
+      requestTimeoutMilliseconds,
+    }),
   });
+}
+
+function required(value, name) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${name} zorunludur.`);
+  }
+  return value.trim();
 }
 
 function parseBoundedInteger(value, name, minimum, maximum) {
@@ -70,6 +120,29 @@ function parseBaseUrl(value, name) {
   return parsed;
 }
 
+function parseOriginUrl(value, name) {
+  const parsed = parseBaseUrl(required(value, name), name);
+  if (parsed.pathname !== "" && parsed.pathname !== "/") {
+    throw new Error(`${name} path içermeyen bir origin olmalıdır.`);
+  }
+  parsed.pathname = "/";
+  return parsed;
+}
+
+function parseBoolean(value, name) {
+  if (value !== "true" && value !== "false") {
+    throw new Error(`${name} true veya false olmalıdır.`);
+  }
+  return value === "true";
+}
+
+function parseIdentifier(value, name) {
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(value)) {
+    throw new Error(`${name} 1-128 güvenli kimlik karakteri içermelidir.`);
+  }
+  return value;
+}
+
 function parseCredential(value, name) {
   if (value === undefined || value === "") {
     return null;
@@ -88,15 +161,96 @@ function parseLabel(value, name) {
   return label;
 }
 
-function createDashboardServer(config = loadConfig(), fetchImplementation = fetch) {
+function createDashboardServer(config = loadConfig(), fetchImplementation = fetch, dependencies = {}) {
+  const authBoundary = config.auth.enabled
+    ? new OidcSessionBoundary(config.auth, fetchImplementation, dependencies)
+    : null;
   return createServer(async (request, response) => {
     applySecurityHeaders(response);
     const requestUrl = new URL(request.url ?? "/", "http://dashboard.local");
 
     try {
-      if (requestUrl.pathname.startsWith("/api/")) {
-        await handleApi(request, response, requestUrl, config, fetchImplementation);
+      if (requestUrl.pathname === "/healthz" && request.method === "GET") {
+        writeJson(response, 200, { status: "ok" });
         return;
+      }
+
+      if (requestUrl.pathname === "/login" && request.method === "GET") {
+        if (!authBoundary) {
+          writeRedirect(response, "/");
+          return;
+        }
+        try {
+          await authBoundary.beginLogin(response);
+        } catch (error) {
+          if (!(error instanceof OidcBoundaryError)) throw error;
+          writeProblem(response, 503, "dashboard_identity_unavailable", "Kimlik sağlayıcı şu anda yanıt vermiyor.");
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/auth/callback" && request.method === "GET" && authBoundary) {
+        try {
+          await authBoundary.completeLogin(request, response, requestUrl);
+        } catch (error) {
+          if (!(error instanceof OidcBoundaryError)) throw error;
+          writeProblem(response, 400, "dashboard_login_failed", "Login yanıtı doğrulanamadı veya süresi doldu.");
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/signed-out" && request.method === "GET") {
+        await serveStatic(request, response, "/signed-out.html");
+        return;
+      }
+      if (requestUrl.pathname === "/styles.css" && request.method === "GET") {
+        await serveStatic(request, response, requestUrl.pathname);
+        return;
+      }
+
+      if (requestUrl.pathname.startsWith("/api/")) {
+        const session = authBoundary?.getSession(request) ?? null;
+        if (requestUrl.pathname === "/api/session" && request.method === "GET") {
+          if (authBoundary && !session) {
+            writeProblem(response, 401, "dashboard_authentication_required", "Dashboard oturumu gerekli.");
+            return;
+          }
+          writeJson(response, 200, authBoundary
+            ? authBoundary.sessionView(session)
+            : { authEnabled: false, user: { displayName: "Yerel geliştirme" }, roles: ["local-operator"], canView: true, canReplay: true, csrfToken: null, expiresAt: null });
+          return;
+        }
+        if (authBoundary && !session) {
+          writeProblem(response, 401, "dashboard_authentication_required", "Dashboard oturumu gerekli.");
+          return;
+        }
+        if (authBoundary && requestUrl.pathname === "/api/logout" && request.method === "POST") {
+          if (!authBoundary.verifyCsrf(session, request.headers["x-csrf-token"])) {
+            writeProblem(response, 403, "dashboard_csrf_invalid", "Logout isteğinin CSRF doğrulaması başarısız.");
+            return;
+          }
+          const redirectTo = await authBoundary.endSession(request, response);
+          writeJson(response, 200, { redirectTo });
+          return;
+        }
+        if (authBoundary && !authBoundary.hasViewerAccess(session)) {
+          writeProblem(response, 403, "dashboard_role_required", "ReleaseGuard viewer veya operator rolü gerekli.");
+          return;
+        }
+        await handleApi(request, response, requestUrl, config, fetchImplementation, authBoundary, session);
+        return;
+      }
+
+      if (authBoundary) {
+        const session = authBoundary.getSession(request);
+        if (!session) {
+          writeRedirect(response, "/login");
+          return;
+        }
+        if (!authBoundary.hasViewerAccess(session)) {
+          writeProblem(response, 403, "dashboard_role_required", "ReleaseGuard viewer veya operator rolü gerekli.");
+          return;
+        }
       }
       await serveStatic(request, response, requestUrl.pathname);
     } catch (error) {
@@ -113,7 +267,7 @@ function createDashboardServer(config = loadConfig(), fetchImplementation = fetc
   });
 }
 
-async function handleApi(request, response, requestUrl, config, fetchImplementation) {
+async function handleApi(request, response, requestUrl, config, fetchImplementation, authBoundary, session) {
   if (requestUrl.pathname === "/api/status" && request.method === "GET") {
     await writeStatus(response, config, fetchImplementation);
     return;
@@ -141,6 +295,14 @@ async function handleApi(request, response, requestUrl, config, fetchImplementat
 
   const replayMatch = requestUrl.pathname.match(/^\/api\/events\/([^/]+)\/replays$/);
   if (replayMatch && request.method === "POST" && canonicalGuid.test(replayMatch[1])) {
+    if (authBoundary && !authBoundary.hasOperatorAccess(session)) {
+      writeProblem(response, 403, "dashboard_operator_role_required", "Replay için ReleaseGuard operator rolü gerekli.");
+      return;
+    }
+    if (authBoundary && !authBoundary.verifyCsrf(session, request.headers["x-csrf-token"])) {
+      writeProblem(response, 403, "dashboard_csrf_invalid", "Replay isteğinin CSRF doğrulaması başarısız.");
+      return;
+    }
     if (request.headers["transfer-encoding"] || Number(request.headers["content-length"] ?? 0) > 0) {
       writeProblem(response, 400, "dashboard_replay_request_invalid", "Replay isteği body içeremez.");
       return;
@@ -385,6 +547,11 @@ function applySecurityHeaders(response) {
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("X-Frame-Options", "DENY");
+}
+
+function writeRedirect(response, location) {
+  response.writeHead(303, { Location: location, "Cache-Control": "no-store" });
+  response.end();
 }
 
 function writeJson(response, status, body) {

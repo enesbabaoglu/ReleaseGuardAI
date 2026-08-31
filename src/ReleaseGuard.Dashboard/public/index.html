@@ -15,10 +15,16 @@
           <span class="brand-mark" aria-hidden="true">RG</span>
           <span><strong>ReleaseGuard</strong><small>Operasyon Merkezi</small></span>
         </a>
-        <div class="service-strip" aria-label="Servis durumu" id="service-strip">
-          <span><i class="signal" id="api-signal"></i> Webhook API</span>
-          <span><i class="signal" id="ai-signal"></i> AI API</span>
-          <span><i class="signal" id="ollama-signal"></i> Ollama</span>
+        <div class="topbar-actions">
+          <div class="service-strip" aria-label="Servis durumu" id="service-strip">
+            <span><i class="signal" id="api-signal"></i> Webhook API</span>
+            <span><i class="signal" id="ai-signal"></i> AI API</span>
+            <span><i class="signal" id="ollama-signal"></i> Ollama</span>
+          </div>
+          <div class="account" aria-label="Kullanıcı oturumu">
+            <span><strong id="account-name">Oturum okunuyor</strong><small id="account-role">—</small></span>
+            <button id="logout-button" type="button" hidden>Çıkış</button>
+          </div>
         </div>
       </header>
 
@@ -71,7 +77,7 @@
               <h3>Önerilen kontroller</h3>
               <ol id="detail-recommendations"><li>Kayıt ayrıntısını yüklemek için bir satır seçin.</li></ol>
             </div>
-            <div class="failure-box" id="failure-box" hidden><h3>Terminal hata</h3><p id="failure-reason"></p><button class="replay-button" id="replay-button" type="button">Güvenli replay başlat</button></div>
+            <div class="failure-box" id="failure-box" hidden><h3>Terminal hata</h3><p id="failure-reason"></p><p class="role-message" id="failure-role-message" hidden>Replay için operator rolü gerekir.</p><button class="replay-button" id="replay-button" type="button">Güvenli replay başlat</button></div>
             <dl class="metadata"><div><dt>AI sağlayıcı</dt><dd id="detail-provider">Ollama</dd></div><div><dt>Model</dt><dd id="detail-model">qwen3:1.7b</dd></div><div><dt>Event ID</dt><dd id="detail-event-id">—</dd></div></dl>
           </aside>
         </section>
