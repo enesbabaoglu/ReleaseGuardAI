@@ -9,5 +9,8 @@
 **/obj
 **/TestResults
 **/dist
+deploy/production/production.env
+deploy/production/secrets/*
+!deploy/production/secrets/.gitignore
 *.user
 *.suo

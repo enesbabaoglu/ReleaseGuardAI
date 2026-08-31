@@ -1,0 +1,442 @@
+name: releaseguard-production
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  caddy:
+    <<: *service-defaults
+    image: caddy:2.10.2-alpine
+    environment:
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?Set CADDY_ACME_EMAIL in the production env file}
+      RELEASEGUARD_PUBLIC_HOST: ${RELEASEGUARD_PUBLIC_HOST:?Set RELEASEGUARD_PUBLIC_HOST in the production env file}
+    ports:
+      - target: 80
+        published: "80"
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: "443"
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: "443"
+        protocol: udp
+        mode: host
+    volumes:
+      - ./deploy/production/Caddyfile:/etc/caddy/Caddyfile:ro
+      - releaseguard-caddy-data:/data
+      - releaseguard-caddy-config:/config
+    networks:
+      - edge
+    depends_on:
+      dashboard:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      webhook-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2015/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 256m
+    pids_limit: 128
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: releaseguard
+      POSTGRES_USER: releaseguard
+      POSTGRES_PASSWORD_FILE: /run/secrets/releaseguard_postgres_password
+    secrets:
+      - releaseguard_postgres_password
+    volumes:
+      - releaseguard-postgres:/var/lib/postgresql/data
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U releaseguard -d releaseguard"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 60s
+    mem_limit: 1g
+    pids_limit: 256
+
+  keycloak-postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD_FILE: /run/secrets/keycloak_postgres_password
+    secrets:
+      - keycloak_postgres_password
+    volumes:
+      - releaseguard-keycloak-postgres:/var/lib/postgresql/data
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 60s
+    mem_limit: 1g
+    pids_limit: 256
+
+  redpanda:
+    <<: *service-defaults
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        rpk redpanda mode production
+        exec rpk redpanda start \
+          --kafka-addr=internal://0.0.0.0:9092 \
+          --advertise-kafka-addr=internal://redpanda:9092 \
+          --rpc-addr=redpanda:33145 \
+          --advertise-rpc-addr=redpanda:33145 \
+          --smp=2 \
+          --memory=3G \
+          --reserve-memory=512M \
+          --default-log-level=info
+    volumes:
+      - releaseguard-redpanda:/var/lib/redpanda/data
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "-X", "brokers=localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    stop_grace_period: 90s
+    mem_limit: 4g
+    pids_limit: 512
+
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.14
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        rpk cluster config set write_caching_default disabled --no-confirm -X admin.hosts=redpanda:9644
+        rpk cluster config set auto_create_topics_enabled false --no-confirm -X admin.hosts=redpanda:9644
+        rpk topic create releaseguard.release-risk-assessed --if-not-exists --brokers redpanda:9092 --partitions 1 --replicas 1
+        rpk topic describe releaseguard.release-risk-assessed --brokers redpanda:9092
+    networks:
+      - app
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  ollama:
+    <<: *service-defaults
+    image: ollama/ollama:0.33.2
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - releaseguard-ollama:/root/.ollama
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    stop_grace_period: 30s
+    mem_limit: 4g
+    pids_limit: 512
+
+  ollama-model-init:
+    image: ollama/ollama:0.33.2
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      RELEASEGUARD_OLLAMA_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ['ollama pull "$${RELEASEGUARD_OLLAMA_MODEL}"']
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - app
+      - egress
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  ai-explanation:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: src/ReleaseGuard.AiExplanation.Api/Dockerfile
+    environment:
+      RELEASEGUARD_AI_PROVIDER: ollama
+      RELEASEGUARD_AI_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+      RELEASEGUARD_AI_TIMEOUT_SECONDS: "60"
+      RELEASEGUARD_AI_PROVIDER_ENDPOINT: http://ollama:11434/api/chat
+      RELEASEGUARD_AI_OUTPUT_LANGUAGE: ${RELEASEGUARD_AI_OUTPUT_LANGUAGE:-tr}
+    networks:
+      - app
+    depends_on:
+      ollama-model-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 512m
+    pids_limit: 128
+
+  webhook-api:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: src/ReleaseGuard.WebhookIngestion.Api/Dockerfile
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export PostgreSql__ConnectionString="Host=postgres;Port=5432;Database=releaseguard;Username=releaseguard;Password=$$(cat /run/secrets/releaseguard_postgres_password);Include Error Detail=false"
+        export GitHubWebhook__Secret="$$(cat /run/secrets/github_webhook_secret)"
+        export AiExplanationQueryAuthentication__ActiveCredential="$$(cat /run/secrets/query_credential)"
+        export AiExplanationReplayAuthentication__ActiveCredential="$$(cat /run/secrets/replay_credential)"
+        exec dotnet ReleaseGuard.WebhookIngestion.Api.dll
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      PostgreSql__ApplyMigrationsOnStartup: "true"
+      Kafka__BootstrapServers: redpanda:9092
+      Kafka__Topic: releaseguard.release-risk-assessed
+      Kafka__ClientId: releaseguard-production-producer
+      KafkaConsumer__BootstrapServers: redpanda:9092
+      KafkaConsumer__Topic: releaseguard.release-risk-assessed
+      KafkaConsumer__GroupId: releaseguard-production-inbox
+      KafkaConsumer__ClientId: releaseguard-production-consumer
+      OutboxDispatcher__Enabled: "true"
+      InboxProcessor__Enabled: "true"
+      AiExplanationClient__BaseUrl: http://ai-explanation:8080
+      AiExplanationProcessor__Enabled: "true"
+      AiExplanationQueryRateLimit__PermitLimit: "60"
+      AiExplanationQueryRateLimit__WindowMilliseconds: "60000"
+      AiExplanationReplay__PermitLimit: "10"
+      AiExplanationReplay__WindowMilliseconds: "60000"
+      RetentionCleanup__Enabled: "true"
+      RetentionCleanup__BatchSize: "100"
+      RetentionCleanup__PollIntervalMilliseconds: "3600000"
+      RetentionCleanup__PublishedOutboxRetentionHours: "168"
+      RetentionCleanup__AcceptedDeliveryRetentionHours: "720"
+      RetentionCleanup__IgnoredDeliveryRetentionHours: "168"
+      RetentionCleanup__CleanupTimeoutMilliseconds: "10000"
+      AiExplanationMetricsExport__Enabled: "false"
+    secrets:
+      - releaseguard_postgres_password
+      - github_webhook_secret
+      - query_credential
+      - replay_credential
+    networks:
+      - edge
+      - app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      ai-explanation:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    stop_grace_period: 60s
+    mem_limit: 768m
+    pids_limit: 256
+
+  keycloak:
+    <<: *service-defaults
+    init: false
+    build:
+      context: .
+      dockerfile: deploy/production/keycloak/Dockerfile
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        export KC_DB_PASSWORD="$$(</run/secrets/keycloak_postgres_password)"
+        export KC_BOOTSTRAP_ADMIN_PASSWORD="$$(</run/secrets/keycloak_admin_password)"
+        exec /opt/keycloak/bin/kc.sh start --optimized --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${RELEASEGUARD_KEYCLOAK_ADMIN_USERNAME:?Set RELEASEGUARD_KEYCLOAK_ADMIN_USERNAME in the production env file}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: /identity
+      KC_HOSTNAME: https://${RELEASEGUARD_PUBLIC_HOST:?Set RELEASEGUARD_PUBLIC_HOST in the production env file}/identity
+      KC_HOSTNAME_STRICT: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_PROXY_TRUSTED_ADDRESSES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      KC_CACHE: local
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_LOG_LEVEL: info
+      RELEASEGUARD_DASHBOARD_EXTERNAL_URL: https://${RELEASEGUARD_PUBLIC_HOST:?Set RELEASEGUARD_PUBLIC_HOST in the production env file}
+    secrets:
+      - keycloak_postgres_password
+      - keycloak_admin_password
+    volumes:
+      - ./deploy/production/keycloak/releaseguard-realm.json:/opt/keycloak/data/import/releaseguard-realm.json:ro
+    networks:
+      - edge
+      - app
+    depends_on:
+      keycloak-postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf "GET /identity/health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -q "200 OK" <&3'
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+    stop_grace_period: 60s
+    mem_limit: 1g
+    pids_limit: 512
+
+  dashboard:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: src/ReleaseGuard.Dashboard/Dockerfile
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export RELEASEGUARD_QUERY_CREDENTIAL="$$(cat /run/secrets/query_credential)"
+        export RELEASEGUARD_REPLAY_CREDENTIAL="$$(cat /run/secrets/replay_credential)"
+        exec node server.mjs
+    environment:
+      DASHBOARD_PORT: "3000"
+      DASHBOARD_REQUEST_TIMEOUT_MILLISECONDS: "5000"
+      RELEASEGUARD_API_BASE_URL: http://webhook-api:8080
+      RELEASEGUARD_AI_BASE_URL: http://ai-explanation:8080
+      RELEASEGUARD_OLLAMA_BASE_URL: http://ollama:11434
+      RELEASEGUARD_AI_PROVIDER: ollama
+      RELEASEGUARD_AI_MODEL: ${RELEASEGUARD_OLLAMA_MODEL:-qwen3:1.7b}
+      DASHBOARD_AUTH_ENABLED: "true"
+      DASHBOARD_EXTERNAL_URL: https://${RELEASEGUARD_PUBLIC_HOST:?Set RELEASEGUARD_PUBLIC_HOST in the production env file}
+      DASHBOARD_SECURE_COOKIE: "true"
+      DASHBOARD_SESSION_LIFETIME_SECONDS: "28800"
+      RELEASEGUARD_OIDC_DISCOVERY_URL: http://keycloak:8080/identity/realms/releaseguard/.well-known/openid-configuration
+      RELEASEGUARD_OIDC_ISSUER: https://${RELEASEGUARD_PUBLIC_HOST:?Set RELEASEGUARD_PUBLIC_HOST in the production env file}/identity/realms/releaseguard
+      RELEASEGUARD_OIDC_BACKCHANNEL_BASE_URL: http://keycloak:8080
+      RELEASEGUARD_OIDC_CLIENT_ID: releaseguard-dashboard
+      RELEASEGUARD_OIDC_VIEWER_ROLE: releaseguard-viewer
+      RELEASEGUARD_OIDC_OPERATOR_ROLE: releaseguard-operator
+    secrets:
+      - query_credential
+      - replay_credential
+    networks:
+      - edge
+      - app
+    depends_on:
+      webhook-api:
+        condition: service_healthy
+      ai-explanation:
+        condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/healthz').then(response => {
+            if (!response.ok) process.exit(1)
+          }).catch(() => process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 256m
+    pids_limit: 128
+
+networks:
+  edge:
+  egress:
+  app:
+    internal: true
+
+volumes:
+  releaseguard-caddy-data:
+  releaseguard-caddy-config:
+  releaseguard-postgres:
+  releaseguard-keycloak-postgres:
+  releaseguard-redpanda:
+  releaseguard-ollama:
+
+secrets:
+  releaseguard_postgres_password:
+    file: ${RELEASEGUARD_POSTGRES_PASSWORD_FILE:-./deploy/production/secrets/releaseguard_postgres_password}
+  keycloak_postgres_password:
+    file: ${RELEASEGUARD_KEYCLOAK_POSTGRES_PASSWORD_FILE:-./deploy/production/secrets/keycloak_postgres_password}
+  keycloak_admin_password:
+    file: ${RELEASEGUARD_KEYCLOAK_ADMIN_PASSWORD_FILE:-./deploy/production/secrets/keycloak_admin_password}
+  github_webhook_secret:
+    file: ${RELEASEGUARD_GITHUB_WEBHOOK_SECRET_FILE:-./deploy/production/secrets/github_webhook_secret}
+  query_credential:
+    file: ${RELEASEGUARD_QUERY_CREDENTIAL_FILE:-./deploy/production/secrets/query_credential}
+  replay_credential:
+    file: ${RELEASEGUARD_REPLAY_CREDENTIAL_FILE:-./deploy/production/secrets/replay_credential}

@@ -10,3 +10,4 @@ TestResults/
 **/.ruff_cache/
 *.egg-info/
 **/dist/
+deploy/production/production.env

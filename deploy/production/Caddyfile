@@ -1,0 +1,44 @@
+{
+	admin off
+	email {$CADDY_ACME_EMAIL}
+	grace_period 10s
+	shutdown_delay 5s
+}
+
+http://127.0.0.1:2015 {
+	respond /healthz 200
+}
+
+{$RELEASEGUARD_PUBLIC_HOST} {
+	encode zstd gzip
+
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+	}
+
+	@blocked_identity path /identity/admin* /identity/realms/master*
+	respond @blocked_identity 404
+	redir /identity /identity/ 308
+
+	handle /identity/* {
+		reverse_proxy keycloak:8080
+	}
+
+	handle /webhooks/github {
+		reverse_proxy webhook-api:8080
+	}
+
+	handle {
+		reverse_proxy dashboard:3000
+	}
+}

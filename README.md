@@ -2,7 +2,7 @@
 
 ReleaseGuard AI; pull request, commit, CI ve deployment olaylarını işleyip değişiklik riskini açıklanabilir biçimde değerlendirmeyi hedefleyen bir yazılım teslimat platformudur.
 
-Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarını PostgreSQL'e atomik olarak kabul eder, sürümlü outbox envelope'unu Kafka'ya at-least-once yayımlar, record'u durable inbox'a idempotent biçimde alır ve ayrı Python servisiyle bounded AI açıklaması üretir. Yetkili servisler tek event sonucunu, bounded keyset sayfalarını ve repository/change için açıkça `latestAccepted` olarak adlandırılmış snapshot'ı okuyabilir. Terminal başarısızlıklar ayrı credential, global bütçe ve `Idempotency-Key` ile yeni, değişmez replay generation'larına alınabilir; V006'daki özgün success/terminal sonuçları yerinde değiştirilmez. Düşük kardinaliteli query metrikleri opt-in OTLP ile collector'a aktarılabilir; bounded retention işi yalnız güvenle sonlandırılmış taşıma kayıtlarını temizler. Yerel operator dashboard'u bu mevcut read/replay sözleşmelerini server-side BFF üzerinden tüketir, Keycloak OIDC ile kullanıcı oturumu açar ve browser'a service credential ya da OIDC token'ı göndermez. Checked-in Docker Compose PostgreSQL, Redpanda, Ollama, ücretsiz `qwen3:1.7b` modeli, Python AI API, .NET API/worker, Keycloak, dashboard ve OpenTelemetry Collector'dan oluşan tam yerel akışı çalıştırır. Production dağıtım/hardening bilinçli olarak ayrı fazdır.
+Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarını PostgreSQL'e atomik olarak kabul eder, sürümlü outbox envelope'unu Kafka'ya at-least-once yayımlar, record'u durable inbox'a idempotent biçimde alır ve ayrı Python servisiyle bounded AI açıklaması üretir. Yetkili servisler tek event sonucunu, bounded keyset sayfalarını ve repository/change için açıkça `latestAccepted` olarak adlandırılmış snapshot'ı okuyabilir. Terminal başarısızlıklar ayrı credential, global bütçe ve `Idempotency-Key` ile yeni, değişmez replay generation'larına alınabilir; V006'daki özgün success/terminal sonuçları yerinde değiştirilmez. Düşük kardinaliteli query metrikleri opt-in OTLP ile collector'a aktarılabilir; bounded retention işi yalnız güvenle sonlandırılmış taşıma kayıtlarını temizler. Operator dashboard'u bu mevcut read/replay sözleşmelerini server-side BFF üzerinden tüketir, Keycloak OIDC ile kullanıcı oturumu açar ve browser'a service credential ya da OIDC token'ı göndermez. `compose.yml` tam yerel geliştirme akışını; ayrı `compose.production.yml` ise tek Linux sunucu için Caddy otomatik TLS, hosta kapalı iç servisler, optimized Keycloak + ayrı PostgreSQL, file-backed secret'lar, bounded kaynak/log ve fail-fast production preflight ile çalıştırılabilir non-HA profili tanımlar.
 
 ## Bu adımda ne yapıyoruz?
 
@@ -14,11 +14,13 @@ Bu depo artık doğrulanmış GitHub `pull_request` teslimatlarını PostgreSQL'
 - Framework bağımlılığı olmayan Node.js dashboard+BFF; liste, ayrıntı, health ve explicit replay akışlarını tek origin altında sunar. Query/replay credential'ları yalnız BFF environment'ında kalır; browser yalnız dar `/api/*` yüzeyini görür.
 - Yerel dashboard login'ini Keycloak public OIDC client'ı, Authorization Code + PKCE S256 ve server-side opaque session ile koruyoruz. `releaseguard-viewer` read yüzeyini, `releaseguard-operator` read + CSRF korumalı replay'i açar; kullanıcı parolası dashboard'a verilmez.
 - Tam yerel Compose yığını gerçek PostgreSQL/Redpanda hattını Ollama + varsayılan `qwen3:1.7b`, dashboard ve OTLP Collector ile ayağa kaldırır; secret'lar environment'dan zorunlu alınır ve kalıcı volume'lar açıkça yönetilir.
-- Mevcut webhook HMAC, durable-accept-then-commit, Kafka offset, timeout/caller cancellation ve değişmez success/terminal sözleşmeleri korunur. Keycloak yalnız dashboard sınırındadır; webhook ve service-to-service credential sözleşmeleri değişmez. Kubernetes/cloud manifesti, tenant modeli, TLS/SASL secret yönetimi ve production HA bu adımda yoktur.
+- Ayrı production Compose profilinde Caddy yalnız `80/443` public edge'idir; dashboard, yalnız exact imzalı webhook ve `/identity` yollarını yönlendirir, Keycloak admin/master yollarını ve bütün iç servis portlarını kapalı tutar. Keycloak `start --optimized`, external HTTPS hostname ve ayrı kalıcı PostgreSQL ile açılır; realm kullanıcı/parola seed etmez.
+- Production secret'ları yalnız ihtiyaç duyan container'lara file-backed Compose secret olarak verilir. Preflight gerçek public DNS adını, altı farklı `0600` secret'ı, published port/network/health/resource sınırlarını, production Keycloak realm'ini ve Redpanda production mode + kapalı write cache/auto-create sözleşmesini fail-fast doğrular.
+- Mevcut webhook HMAC, durable-accept-then-commit, Kafka offset, timeout/caller cancellation ve değişmez success/terminal sözleşmeleri korunur. Kubernetes/cloud manifesti veya tenant modeli eklenmez; tek sunucu/tek broker/tek instance profili production HA, autoscaling, deployment-wide limiter, dış secret manager ya da monitoring sistemi iddiasında bulunmaz.
 
 ## Neden yapıyoruz?
 
-Backend akışının yerelde tek komutla doğrulanabilmesi, kimliği doğrulanmış operatörün sonucu bounded biçimde okuyup terminal failure'ı geçmişi ezmeden yeniden deneyebilmesi ve açıklama modelini ücretli bir dış API'ye veri göndermeden çalıştırabilmesi aynı geliştirme döngüsünü tamamlar. `latestAccepted` adı domain ordering iddiasını önler; replay generation modeli audit geçmişini korur; retention bağımlı kalıcı kayıtları silmez; OTLP ise credential veya `eventId` etiketi üretmeden kapasite ayarı için ölçüm sağlar. Dashboard gözlem ve kontrollü replay arayüzüdür; yeni risk kararı veya tenant modeli değildir. Limiter'lar, worker'lar ve dashboard session store'u per-instance'dır; local Compose PLAINTEXT geliştirme ortamıdır ve deployment-wide kota/session/HA garantisi vermez.
+Backend akışının yerelde tek komutla doğrulanabilmesi, kimliği doğrulanmış operatörün sonucu bounded biçimde okuyup terminal failure'ı geçmişi ezmeden yeniden deneyebilmesi ve açıklama modelini ücretli bir dış API'ye veri göndermeden çalıştırabilmesi aynı geliştirme döngüsünü tamamlar. `latestAccepted` adı domain ordering iddiasını önler; replay generation modeli audit geçmişini korur; retention bağımlı kalıcı kayıtları silmez; OTLP ise credential veya `eventId` etiketi üretmeden kapasite ayarı için ölçüm sağlar. Dashboard gözlem ve kontrollü replay arayüzüdür; yeni risk kararı veya tenant modeli değildir. Production profili aynı kanıtlanmış uygulama image'larını tek public TLS origin ve kapalı iç ağla tekrarlar; buna rağmen limiter'lar, worker'lar ve dashboard session store'u per-instance, bütün stateful bileşenler tek replica olduğu için deployment-wide kota/session/HA garantisi vermez.
 
 ## Mimari kararlar
 
@@ -362,6 +364,20 @@ Accepted delivery receipt'i silmek webhook sınırındaki duplicate response haf
 
 Checked-in dosyada gerçek secret yoktur. PostgreSQL parolası, GitHub webhook secret'ı, query credential'ı ve replay credential'ı environment'dan zorunlu alınır. Ollama local API'si authentication kullanmaz; yalnız Compose ağı/localhost geliştirme sınırında tutulmalıdır. Kafka PLAINTEXT, collector authentication'sız ve portlar local geliştirme içindir. Bu yığın production deployment manifesti değildir ve TLS/SASL, secret manager, kullanıcı RBAC'i, replica/HA, backup, autoscaling ya da deployment-wide shared limiter sağlamaz. Ollama container imajı ve model blob'u ilk çalıştırmada internetten indirilir; sonrasında named volume yeniden kullanılır. Docker Desktop/macOS GPU passthrough davranışı platforma bağlıdır; küçük default model CPU'da çalışabilir fakat yanıt süresi donanıma göre değişir.
 
+### Tek sunuculu production Docker Compose sınırı
+
+`compose.production.yml`, local Compose'un override'ı değil bağımsız bir production tanımıdır; development port ve `start-dev` ayarlarının merge yoluyla yanlışlıkla taşınmasını önler. [Docker'ın tek sunucuda production Compose](https://docs.docker.com/compose/how-tos/production/) yaklaşımına uygun restart policy, healthcheck, kalıcı volume, log rotasyonu, bellek/PID sınırı ve application code bind-mount'u olmayan image'lar kullanır.
+
+Tek public sınır Caddy'dir. Caddy otomatik ACME TLS/HTTP→HTTPS, HSTS ve güvenlik header'ları uygular; yalnız dashboard `/`, exact `/webhooks/github` ve Keycloak `/identity/*` yollarını iç servislere aktarır. Keycloak `/identity/admin*` ve master realm yolları public `404` alır; .NET health/read/replay, PostgreSQL, Redpanda, Ollama, Python AI ve Keycloak management portları publish edilmez. Caddy yalnız `edge` ağına bağlıdır ve PostgreSQL/Redpanda/Ollama'nın bulunduğu internal `app` ağına route taşımaz. Model indiren tek-seferlik job ayrı egress ağı alır. Caddy'nin [Automatic HTTPS](https://caddyserver.com/docs/automatic-https) davranışı için gerçek DNS'in sunucuya yönelmesi, inbound 80/443 ve kalıcı `/data` volume'u gerekir.
+
+Keycloak image'i PostgreSQL/health/metrics ve `/identity` relative path'i build-time sabitlenerek optimize edilir; runtime `start --optimized --import-realm`, strict external HTTPS hostname, trusted Docker private proxy adresleri ve ayrı PostgreSQL kullanır. Health management portunda `/identity/health/ready` ile içeriden ölçülür, port `9000` public edilmez. Bu seçim Keycloak'ın [production configuration](https://www.keycloak.org/server/configuration-production), [reverse proxy](https://www.keycloak.org/server/reverseproxy) ve [container build](https://www.keycloak.org/server/containers) sınırlarını izler. Production realm'i `sslRequired=external`, PKCE S256 public client ve `viewer/operator` rollerini taşır fakat kullanıcı/parola taşımaz; interaktif provisioning yardımcısı ilk parolayı temporary oluşturur.
+
+Altı bağımsız değer Compose [file-backed secrets](https://docs.docker.com/compose/how-tos/use-secrets/) olarak yalnız gereken servislere `/run/secrets` altında bağlanır. `production.env` yalnız public domain/e-posta, admin kullanıcı adı, model ve dil gibi non-secret configuration taşır ve git tarafından yok sayılır. `validate-production-compose.mjs`; örnek/localhost/IP/path domain'i, eksik/aynı/gevşek izinli/symlink secret'ı, dev Keycloak/Redpanda komutunu, doğrudan published iç portu, seeded production kullanıcısını veya eksik resource/health sınırını başlamadan reddeder. Compose secret dosyası host root'u, disk kaybı veya kötü niyetli container'a karşı harici secret manager değildir; disk encryption ve off-host şifreli secret yedeği gerekir.
+
+Redpanda her başlangıçta `rpk redpanda mode production` uygular; `dev-container`, `overprovisioned` ve `unsafe-bypass-fsync` kullanılmaz. Init işi cluster-wide write cache'i `disabled`, topic auto-create'i `false` yapar ve tek ReleaseGuard topic'ini idempotent oluşturur. Yine de [Redpanda production gereksinimleri](https://docs.redpanda.com/current/deploy/redpanda/manual/production/requirements/) en az üç ayrı broker/node ve uygun NVMe/IOPS önerir. Buradaki tek broker, tek partition, tek replica yalnız kullanıcı tarafından seçilen tek-sunucu Compose sınırıdır; host/disk/broker kaybına tolerans veya resmî HA topolojisi değildir.
+
+`app` ağı hosta kapalı olsa da Kafka/PostgreSQL containerlar arası trafik PLAINTEXT'tir. Bu profil tek güvenilen Linux host ve güvenilen container image'ları tehdit modeline dayanır; ayrı host, düşman tenant/container veya çok-node topolojide TLS/SASL/mTLS gerekir. Dashboard session'ı process belleğinde olduğundan restart login'i düşürür. Query/replay limiter'ı per-instance olduğundan instance çoğaltmak toplam kotayı çoğaltır. Runtime PostgreSQL identity startup migration için DDL sahibidir. Monitoring backend/paging, otomatik off-host backup, restore orchestration, WAF/DDoS, MFA/SMTP ve zero-downtime upgrade kurulmaz. Kurulum, user provisioning, health, tutarlı backup/restore provası, upgrade/rollback ve bütün trade-off'lar [production işletim rehberinde](deploy/production/OPERATIONS.md) adım adım tanımlıdır.
+
 ### Outbox dispatcher claim, retry ve crash semantiği
 
 V003 mevcut outbox tablosuna şu alanları ekler:
@@ -530,7 +546,7 @@ Compose profili dashboard'u [Keycloak `26.7.2`](https://www.keycloak.org/downloa
 
 Browser'daki `releaseguard_session` yalnız rastgele 256-bit tanıtıcıdır; `HttpOnly`, `SameSite=Lax`, local HTTP profilde `Secure=false` özellikleriyle yazılır. OIDC ID token, backend query/replay credential'ları ve parola browser storage/cookie/HTML'e konmaz. Login transaction ve session store process belleğinde ayrı ayrı en fazla `1000` kayıttır; login transaction'ı 5 dakika, session en fazla configured süre ve ID token expiry'nin küçüğü kadar yaşar. Process restart kullanıcıları logout eder. Birden çok dashboard instance'ı session paylaşmaz; production'da paylaşımlı/şifreli session store veya açık sticky-session stratejisi gerekir.
 
-Bu hâlâ **yerel geliştirme/operator** kimlik sınırıdır. Compose'taki `start-dev`, HTTP issuer, environment bootstrap parolaları, seeded local operator ve Keycloak'ın development database'i internete açılmamalıdır. Production için optimized Keycloak image/start, TLS ve doğru external hostname, kalıcı desteklenen DB, HA/cache topolojisi, secret manager, admin erişim sınırı, kullanıcı yaşam döngüsü/MFA, secure cookie, audit ve shared dashboard session tasarımı gerekir. Repoda tenant izolasyonu veya organizasyon bazlı policy yoktur.
+`compose.yml` içindeki `start-dev`, HTTP issuer, environment bootstrap parolaları, seeded local operator ve Keycloak development database'i hâlâ yalnız **yerel geliştirme/operator** sınırıdır ve internete açılmamalıdır. Ayrı production profili optimized image/start, Caddy TLS, strict external hostname, kalıcı PostgreSQL, file-backed secret, public admin engeli, seeded-user yasağı ve secure cookie sağlar. Tek instance local cache/session seçimi nedeniyle Keycloak/dashboard HA sağlamaz; kullanıcı yaşam döngüsü, MFA/SMTP, audit sink, harici secret manager ve shared session store organizasyon tarafından ayrıca kurulmalıdır. Repoda tenant izolasyonu veya organizasyon bazlı policy yoktur.
 
 Dashboard environment'ı:
 
@@ -649,20 +665,32 @@ Workspace'teki mevcut `ActivityIngestionService`, `docker-compose.yaml`, `output
 ```text
 ReleaseGuardAI/
 ├── .dockerignore
+├── compose.production.yml
 ├── compose.yml
 ├── compose.kafka.yml
 ├── contracts/
 │   └── release-risk-assessed.v1.example.json
 ├── Directory.Build.props
 ├── deploy/
-│   └── local/
+│   ├── local/
+│   │   ├── keycloak/
+│   │   │   └── releaseguard-realm.json
+│   │   └── otel-collector-config.yml
+│   └── production/
+│       ├── Caddyfile
+│       ├── OPERATIONS.md
+│       ├── production.env.example
 │       ├── keycloak/
+│       │   ├── Dockerfile
 │       │   └── releaseguard-realm.json
-│       └── otel-collector-config.yml
+│       └── secrets/
+│           └── .gitignore
 ├── global.json
 ├── ReleaseGuard.sln
 ├── scripts/
-│   └── test-dotnet-python-contract.sh
+│   ├── provision-production-keycloak-user.sh
+│   ├── test-dotnet-python-contract.sh
+│   └── validate-production-compose.mjs
 ├── src/
 │   ├── ReleaseGuard.AiExplanation.Api/
 │   │   ├── Dockerfile
@@ -693,6 +721,7 @@ ReleaseGuardAI/
 │   │   │   ├── build.mjs
 │   │   │   └── check.mjs
 │   │   └── tests/
+│   │       ├── production-compose.test.mjs
 │   │       └── server.test.mjs
 │   └── ReleaseGuard.WebhookIngestion.Api/
 │       ├── Dockerfile
@@ -796,7 +825,7 @@ ReleaseGuardAI/
         └── TestApplicationFactory.cs
 ```
 
-Ek production altyapı klasörleri hedef platform seçildiğinde oluşturulacaktır; boş Kubernetes/cloud yer tutucuları eklenmemiştir.
+Production hedefi tek Linux sunuculu Docker Compose olarak seçildiği için yalnız bu platformun Caddy/Keycloak/operasyon dosyaları eklenmiştir; boş Kubernetes/cloud yer tutucuları yoktur.
 
 ## Tekrarlanabilir komutlar
 
@@ -872,6 +901,36 @@ docker compose down --volumes --remove-orphans
 ```
 
 Compose ücretli model API'sine bağlanmaz; model inference'ı local Ollama'da çalışır. İmaj/modelin ilk indirilmesi için internet gerekir. PLAINTEXT Kafka, authentication'sız local Ollama/collector, Keycloak `start-dev` + HTTP, local seeded operator ve environment secret'ları production güvenlik modeli değildir.
+
+### Tek sunuculu production Docker Compose
+
+Production profili local profile ile merge edilmez. Gerçek Linux sunucuda önce non-secret env dosyasını ve altı `0600` secret dosyasını [işletim rehberine](deploy/production/OPERATIONS.md) göre hazırlayın. Ardından preflight, build ve başlangıç:
+
+```bash
+node scripts/validate-production-compose.mjs \
+  --env-file deploy/production/production.env \
+  --check-secrets
+
+docker compose \
+  --env-file deploy/production/production.env \
+  -f compose.production.yml \
+  build --pull
+
+docker compose \
+  --env-file deploy/production/production.env \
+  -f compose.production.yml \
+  up --detach --wait
+```
+
+Production realm kullanıcı seed etmez. İlk viewer/operator kullanıcı interaktif ve terminale parola yazdırmadan oluşturulur:
+
+```bash
+bash scripts/provision-production-keycloak-user.sh \
+  deploy/production/production.env \
+  releaseguard-operator
+```
+
+Caddy'nin sertifika alması için gerçek domain sunucuya çözülmeli, inbound 80/443 açık ve `production.env` içindeki ACME e-postası geçerli olmalıdır. Public yüzey yalnız dashboard, `/identity/*` (admin/master hariç) ve exact signed webhook'tur. Tek-host profile geçmeden önce backup/restore provası, upgrade/rollback, Redpanda durability kontrolleri, host capacity ve kalan HA/monitoring/MFA/least-privilege trade-off'ları `deploy/production/OPERATIONS.md` üzerinden kabul edilmelidir.
 
 Python 3.9+ AI servisini ayrı sanal ortamda kurup doğrulamak için:
 
@@ -1269,7 +1328,7 @@ Bu sorgu yalnız terminal işleri okur; pending/başarılı işleri, raw Kafka p
 
 ## Nasıl doğruladık?
 
-Backend + local AI + dashboard tamamlaması aşağıdaki sınırlarla doğrulanır:
+Backend + local AI + dashboard + tek-host production Compose tamamlaması aşağıdaki sınırlarla doğrulanır:
 
 1. OTLP options default/sınır/fail-fast testleri ve gerçek HTTP protobuf collector testi yalnız stabil query meter/instrument'larının export edildiğini; kapalı modun dış I/O yapmadığını doğrular.
 2. Read endpoint testleri authentication'ın `401` önceliğini, active/previous ortak global bütçeyi, malformed parametrelerin DB öncesinde sonlanmasını, cursor canonicality/keyset sınırını, `latestAccepted` seçimini ve timeout/caller cancellation ayrımını kapsar.
@@ -1279,13 +1338,15 @@ Backend + local AI + dashboard tamamlaması aşağıdaki sınırlarla doğrulan�
 6. Mevcut webhook HMAC/idempotency, V1 outbox/Kafka, durable-accept-then-commit, AI retry/terminal/DLQ, query `401/200/400/404/429/503`, `/health` ve gerçek local Uvicorn regresyon paketleri aynen çalışır.
 7. Ollama options/provider testleri local endpoint sınırını, API key bulunmamasını, structured non-streaming chat request'ini, Türkçe/İngilizce prompt'u, strict response validation'ı ve timeout/cancellation ayrımını kapsar.
 8. Dashboard testleri options fail-fast'i, unauthenticated `401`/HTML redirect sırasını, public health'i, Authorization Code + PKCE parametrelerini, state/nonce transaction binding'ini, RS256/JWKS/issuer/audience/expiry doğrulamasını, opaque cookie'yi, viewer/operator ayrımını, replay/logout CSRF'sini ve service credential'ın server-side kalmasını gerçek localhost server üzerinden doğrular. Mevcut list allowlist, canonical idempotency key, bounded response ve browser security regresyonları da korunur.
-9. `docker compose config`, üç uygulama image build'i ve `docker compose up --wait` sonrasında Keycloak realm/client/role importu, Ollama model readiness, health, V008 şema ve topic gerçek container'larla doğrulanır. İmzalı GitHub webhook → outbox/Kafka → inbox → Ollama → immutable completed AI query → Keycloak login korumalı dashboard list/detail zinciri gerçek `qwen3:1.7b` modeliyle uçtan uca çalıştırılır.
-10. Python Ruff lint/format/compile + tüm Python testleri, Node syntax/test/static build ile `.NET format`, restore, warning-as-error build ve Testcontainers PostgreSQL/Redpanda dahil tüm .NET testleri tamamlanır; entegrasyonlar Docker yokken sessizce atlanmaz.
+9. Production Compose testleri normalize edilmiş gerçek `docker compose config` modelinde yalnız Caddy'nin `80/443` publish etmesini, internal app ağı/ayrı model egress'ini, pinned image/resource/health/restart sınırlarını, file-backed least-secret grant'lerini, production-only Keycloak/realm kurallarını ve dev/seeded/direct-port mutasyonlarının fail-closed reddini kapsar. Domain ve secret preflight; localhost/IP/örnek domain, duplicate/symlink/gevşek izin/kısa secret hatalarını değer sızdırmadan reddeder.
+10. Gerçek official container doğrulamasında Caddyfile parser'ı valid sonucu verir; dört application/Keycloak image'i build edilir. Optimized Keycloak ayrı PostgreSQL ile healthy olur, external-TLS realm'i usersız import eder ve interaktif yardımcı temporary viewer'ı doğru client rolüyle yaratır. Redpanda restart sonrası production mode'da developer/overprovisioned ayar taşımaz; write cache `disabled`, auto-create `false`, topic `1 partition / 1 replica` olur. Bu doğrulamanın sahte container/volume/secret'ları sonunda silinir.
+11. Local `docker compose config`, üç uygulama image build'i ve `docker compose up --wait` sonrasında Keycloak realm/client/role importu, Ollama model readiness, health, V008 şema ve topic gerçek container'larla doğrulanır. İmzalı GitHub webhook → outbox/Kafka → inbox → Ollama → immutable completed AI query → Keycloak login korumalı dashboard list/detail zinciri gerçek `qwen3:1.7b` modeliyle uçtan uca çalıştırılır.
+12. Python Ruff lint/format/compile + tüm Python testleri, Node syntax/test/static build ile `.NET format`, restore, warning-as-error build ve Testcontainers PostgreSQL/Redpanda dahil tüm .NET testleri tamamlanır; entegrasyonlar Docker yokken sessizce atlanmaz.
 
-Son doğrulamada Python Ruff lint/format/compile kontrolleri ve Ollama adapter'ı dahil `56/56` Python testi başarılı oldu. `.NET format` ve restore tamamlandı; warning-as-error build `0 uyarı / 0 hata`, gerçek PostgreSQL 16, Redpanda, OTLP collector listener'ı ve local Uvicorn sözleşmesi dahil .NET paketi `323/323 başarılı, 0 atlanan` sonucunu verdi. Dashboard syntax/static build kontrolleri ve gerçek localhost BFF/OIDC sınırı üzerinden `13/13` Node testi geçti. Toplam `392` test başarılıdır. Ayrıca `docker compose config`, üç uygulama image build'i, official Keycloak realm importu, Ollama image/model hazırlığı ve tam yığın `up --wait` koşusu; imzalı webhook'tan gerçek local modelle üretilen completed AI açıklamasının Keycloak login korumalı dashboard BFF'de görünmesine kadar doğrulandı.
+Son doğrulamada Python Ruff lint/format/compile kontrolleri ve Ollama adapter'ı dahil `56/56` Python testi başarılı oldu. `.NET format` ve restore tamamlandı; warning-as-error build `0 uyarı / 0 hata`, gerçek PostgreSQL 16, Redpanda, OTLP collector listener'ı ve local Uvicorn sözleşmesi dahil .NET paketi `323/323 başarılı, 0 atlanan` sonucunu verdi. Dashboard syntax/static build kontrolleri, gerçek localhost BFF/OIDC sınırı ve production Compose fail-closed testleri üzerinden `16/16` Node testi geçti. Toplam `395` test başarılıdır. Gerçek .NET→Python process sözleşmesi ayrıca geçti. Local yığında `docker compose config`, üç uygulama image build'i, official Keycloak realm importu, Ollama image/model hazırlığı ve tam `up --wait`; imzalı webhook'tan gerçek local modelle üretilen completed AI açıklamasının Keycloak login korumalı dashboard BFF'de görünmesine kadar doğrulandı. Production profilinde normalize Compose modeline ek olarak dört image build'i, Caddy official parser'ı, optimized Keycloak+PostgreSQL health/realm/user provisioning ve restart sonrası Redpanda production/durability/topic sınırı gerçek container'larla doğrulandı; yalnız validation için oluşturulan container, volume ve sahte kullanıcılar sonunda silindi.
 
 ## Sıradaki küçük adım
 
-Backend checkpoint zinciri, ücretsiz local Ollama entegrasyonu, Keycloak kimlikli operator dashboard'u ve tam local Compose akışı tamamlanmıştır. Sıradaki tek faz production readiness'tir; kullanıcı kararı gereği şimdi uygulanmaz.
+Backend checkpoint zinciri, ücretsiz local Ollama, Keycloak kimlikli operator dashboard'u, tam local Compose ve tek Linux sunucu için TLS/secret/production-Keycloak sınırları olan non-HA production Compose tamamlanmıştır.
 
-Identity provider olarak Keycloak seçilmiştir; fakat burada yalnız local realm ve iki kaba client rolü vardır. Production fazının ilk dar checkpoint'i hedef platformu ve tehdit modelini seçmek, ardından production Keycloak topology/TLS/database/HA, kullanıcı provisioning-MFA-audit, shared dashboard session, secret manager, Kafka TLS/SASL, migration/least privilege, backup/restore, deployment-wide shared limiting ve alarm/SLO sınırlarını karara bağlamaktır. Bu karar verilene kadar local dashboard internete açılmamalı ve depoya varsayımsal Kubernetes/cloud manifesti eklenmemelidir.
+Sıradaki tek dar checkpoint production PostgreSQL yetki ayrımıdır: migration'ı tek seferlik ayrı command/service ve DDL sahibi credential ile çalıştırmak; uzun yaşayan API/worker'a yalnız gerekli tablo/view/sequence DML/SELECT yetkileri bulunan ayrı runtime identity vermek. Bu çalışma V008 şemasını veya endpoint sözleşmelerini değiştirmemeli, Keycloak'ın kendi DB migration sahibinden ayrılmalı ve gerçek empty/upgrade/restart/rollback PostgreSQL testleriyle kanıtlanmalıdır. Monitoring backend/SLO, otomatik off-host backup, MFA/SMTP, multi-node Redpanda/Kafka TLS-SASL ve HA daha sonraki, ayrı karar checkpointleridir; mevcut tek-host profil bunları sağladığını iddia etmez.
